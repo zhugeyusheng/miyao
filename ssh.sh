@@ -377,6 +377,41 @@ logo_change_menu() {
   done
 }
 
+install_script_shortcut() {
+  local key lower upper rc_file tmp begin end
+  print_header
+  echo '             脚本调出快捷键'
+  echo '------------------------------------------------'
+  echo '设置后，在 root 终端直接输入一个字母即可调出本脚本。'
+  read -r -p '请输入一个英文字母作为快捷键：' key
+  [[ "$key" =~ ^[A-Za-z]$ ]] || { warn '只能输入一个英文字母。'; pause; return; }
+
+  lower="${key,,}"
+  upper="${key^^}"
+  rc_file='/root/.bashrc'
+  begin='# >>> ZHUGEYUSHENG SSH 快捷键 >>>'
+  end='# <<< ZHUGEYUSHENG SSH 快捷键 <<<'
+  touch "$rc_file"
+  tmp="$(mktemp)"
+
+  # 移除旧快捷键区块，再写入新的大小写快捷键；不会覆盖其他 .bashrc 内容。
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin { skip=1; next }
+    $0 == end { skip=0; next }
+    !skip { print }
+  ' "$rc_file" > "$tmp"
+  cat >> "$tmp" <<EOF
+
+$begin
+alias $lower='bash <(curl -fsSL https://ssh.126260.xyz)'
+alias $upper='bash <(curl -fsSL https://ssh.126260.xyz)'
+$end
+EOF
+  mv -f -- "$tmp" "$rc_file"
+  ok "快捷键已设置：输入 $lower 或 $upper 即可调出脚本。"
+  info '退出本脚本后执行：source /root/.bashrc；或重新连接 SSH 后生效。'
+  pause
+}
 change_hostname() {
   local current new_name
   print_header
@@ -410,6 +445,7 @@ main_menu() {
     echo '1. root 登录模式'
     echo '2. Logo 改变'
     echo '3. 主机用户名更改'
+    echo '4. 脚本调出快捷键'
     echo '0. 退出'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
@@ -417,6 +453,7 @@ main_menu() {
       1) root_login_menu ;;
       2) logo_change_menu ;;
       3) change_hostname ;;
+      4) install_script_shortcut ;;
       0) clear; exit 0 ;;
       *) warn '无效选择'; pause ;;
     esac
