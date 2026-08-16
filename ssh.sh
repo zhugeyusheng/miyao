@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
-# root-ssh-login-manager.sh
-# 管理 root 用户的 SSH 密钥/密码登录方式。
+# ssh.sh - ZHUGEYUSHENG root SSH 登录与 VPS Logo 管理
 set -Eeuo pipefail
 
 SSH_DIR='/root/.ssh'
 AUTHORIZED_KEYS="$SSH_DIR/authorized_keys"
 SSHD_MAIN='/etc/ssh/sshd_config'
 SSHD_DIR='/etc/ssh/sshd_config.d'
-SSHD_DROPIN="$SSHD_DIR/99-root-login-manager.conf"
+SSHD_DROPIN="$SSHD_DIR/99-zhugeyusheng-root-login.conf"
 
-blue='\033[1;34m'; green='\033[1;32m'; yellow='\033[1;33m'; red='\033[1;31m'; reset='\033[0m'
-info() { printf "%b[信息]%b %s\n" "$blue" "$reset" "$*"; }
-ok() { printf "%b[成功]%b %s\n" "$green" "$reset" "$*"; }
-warn() { printf "%b[警告]%b %s\n" "$yellow" "$reset" "$*" >&2; }
-die() { printf "%b[错误]%b %s\n" "$red" "$reset" "$*" >&2; exit 1; }
-pause() { read -r -p '按 Enter 返回菜单…' _; }
+MOTD_DIR='/etc/update-motd.d'
+MOTD_BACKUP='/etc/update-motd.d.zhugeyusheng-backup'
+MOTD_FILE="$MOTD_DIR/01-zhugeyusheng-vps"
+MOTD_STATIC='/etc/motd'
+MOTD_STATIC_BACKUP='/etc/motd.zhugeyusheng-backup'
+
+GREEN='\033[1;32m'
+CYAN='\033[1;36m'
+YELLOW='\033[1;33m'
+RED='\033[1;31m'
+RESET='\033[0m'
+
+info() { printf "%b[信息]%b %s\n" "$CYAN" "$RESET" "$*"; }
+ok() { printf "%b[成功]%b %s\n" "$GREEN" "$RESET" "$*"; }
+warn() { printf "%b[警告]%b %s\n" "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf "%b[错误]%b %s\n" "$RED" "$RESET" "$*" >&2; exit 1; }
+pause() { read -r -p '按 Enter 返回…' _; }
 
 require_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die '请以 root 身份运行：sudo bash root-ssh-login-manager.sh'
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 权限运行：sudo bash $0"
 }
 
 cleanup() {
@@ -27,12 +37,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+print_header() {
+  clear
+  printf '%b================================================%b\n' "$GREEN" "$RESET"
+  printf '%b   ███████╗██╗  ██╗██╗   ██╗ ██████╗ ███████╗%b\n' "$GREEN" "$RESET"
+  printf '%b   ╚══███╔╝██║  ██║██║   ██║██╔════╝ ██╔════╝%b\n' "$GREEN" "$RESET"
+  printf '%b     ███╔╝ ███████║██║   ██║██║  ███╗█████╗  %b\n' "$GREEN" "$RESET"
+  printf '%b    ███╔╝  ██╔══██║██║   ██║██║   ██║██╔══╝  %b\n' "$GREEN" "$RESET"
+  printf '%b   ███████╗██║  ██║╚██████╔╝╚██████╔╝███████╗%b\n' "$GREEN" "$RESET"
+  printf '%b   ╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝%b\n' "$GREEN" "$RESET"
+  printf '%b              Y U S H E N G%b\n' "$GREEN" "$RESET"
+  printf '%b================================================%b\n' "$GREEN" "$RESET"
+}
+
 root_key_count() {
   [[ -f "$AUTHORIZED_KEYS" ]] || { printf '0'; return; }
-  awk '
-    $1 ~ /^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)$/ && $2 ~ /^[A-Za-z0-9+/]+={0,3}$/ { count++ }
-    END { print count+0 }
-  ' "$AUTHORIZED_KEYS"
+  awk '$1 ~ /^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)$/ && $2 ~ /^[A-Za-z0-9+/]+={0,3}$/ { count++ } END { print count+0 }' "$AUTHORIZED_KEYS"
 }
 
 find_sshd() {
@@ -41,8 +61,19 @@ find_sshd() {
   elif [[ -x /usr/sbin/sshd ]]; then
     SSHD_BIN='/usr/sbin/sshd'
   else
-    die '未找到 sshd，拒绝修改 SSH 配置以避免无法校验。'
+    die '未找到 sshd，拒绝修改 SSH 配置。'
   fi
+}
+
+root_effective_config() {
+  find_sshd
+  "$SSHD_BIN" -T -f "$SSHD_MAIN" -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null
+}
+
+root_authorized_keys_file_enabled() {
+  local files
+  files="$(root_effective_config | awk '/^authorizedkeysfile / { $1=""; sub(/^ /, ""); print; exit }')"
+  [[ "$files" =~ (^|[[:space:]])(\.ssh/authorized_keys|%h/\.ssh/authorized_keys)([[:space:]]|$) ]]
 }
 
 restore_ssh_config() {
@@ -60,74 +91,30 @@ ensure_manager_include() {
   local include_line tmp
   include_line="Include $SSHD_DROPIN"
   MAIN_BACKUP=''
-  grep -Fqx "$include_line" "$SSHD_MAIN" 2>/dev/null && return
+  grep -Fqx "$include_line" "$SSHD_MAIN" 2>/dev/null && return 0
 
-  MAIN_BACKUP="${SSHD_MAIN}.bak.root-login-manager.$(date +%Y%m%d-%H%M%S)"
+  MAIN_BACKUP="${SSHD_MAIN}.bak.zhugeyusheng.$(date +%Y%m%d-%H%M%S)"
   cp -p -- "$SSHD_MAIN" "$MAIN_BACKUP"
   tmp="$(mktemp "${SSHD_MAIN}.XXXXXX")"
   {
-    printf '%s\n' '# Added by root-ssh-login-manager.sh; keep this line before other SSH options.'
+    printf '%s\n' '# Added by ssh.sh. Keep this line before other SSH options.'
     printf '%s\n' "$include_line"
     cat "$SSHD_MAIN"
   } > "$tmp"
   chmod 600 "$tmp"
   mv -f -- "$tmp" "$SSHD_MAIN"
-  info "已备份并更新 $SSHD_MAIN，以确保管理配置优先加载。"
 }
 
 verify_root_auth_mode() {
   local mode="$1" effective permit password pubkey
-  effective="$("$SSHD_BIN" -T -f "$SSHD_MAIN" -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null || true)"
+  effective="$(root_effective_config || true)"
   permit="$(printf '%s\n' "$effective" | awk '$1 == "permitrootlogin" {print $2; exit}')"
   password="$(printf '%s\n' "$effective" | awk '$1 == "passwordauthentication" {print $2; exit}')"
   pubkey="$(printf '%s\n' "$effective" | awk '$1 == "pubkeyauthentication" {print $2; exit}')"
-
   case "$mode" in
     key) [[ ( "$permit" == 'prohibit-password' || "$permit" == 'without-password' ) && "$password" == 'no' && "$pubkey" == 'yes' ]] ;;
     password) [[ "$permit" == 'yes' && "$password" == 'yes' && "$pubkey" == 'no' ]] ;;
   esac
-}
-write_root_auth_config() {
-  local mode="$1" content tmp
-  find_sshd
-  [[ -f "$SSHD_MAIN" ]] || die "未找到 SSH 主配置：$SSHD_MAIN"
-  mkdir -p -- "$SSHD_DIR"
-  DROPIN_BACKUP=''
-  [[ -f "$SSHD_DROPIN" ]] && DROPIN_BACKUP="${SSHD_DROPIN}.bak.$(date +%Y%m%d-%H%M%S)"
-  [[ -n "$DROPIN_BACKUP" ]] && cp -p -- "$SSHD_DROPIN" "$DROPIN_BACKUP"
-
-  case "$mode" in
-    key)
-      content=$'# Managed by root-ssh-login-manager.sh\n# Root: key login only. Root SSH password login is disabled.\nPermitRootLogin prohibit-password\nMatch User root\n    AuthenticationMethods publickey\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PubkeyAuthentication yes\nMatch all\n'
-      ;;
-    password)
-      content=$'# Managed by root-ssh-login-manager.sh\n# Root: password login only. Root public-key login is disabled.\nPermitRootLogin yes\nMatch User root\n    AuthenticationMethods any\n    PasswordAuthentication yes\n    KbdInteractiveAuthentication no\n    PubkeyAuthentication no\nMatch all\n'
-      ;;
-    *) die '内部错误：未知认证模式' ;;
-  esac
-
-  tmp="$(mktemp "${SSHD_DIR}/.root-login-manager.XXXXXX")"
-  printf '%s' "$content" > "$tmp"
-  chmod 600 "$tmp"
-  mv -f -- "$tmp" "$SSHD_DROPIN"
-  ensure_manager_include
-
-  if ! "$SSHD_BIN" -t -f "$SSHD_MAIN"; then
-    warn '新的 SSH 配置未通过校验，已回滚。'
-    restore_ssh_config
-    die '未修改 SSH 服务配置'
-  fi
-  if ! verify_root_auth_mode "$mode"; then
-    warn 'SSH 生效配置未达到“仅一种 root 登录方式”的要求，已回滚。'
-    restore_ssh_config
-    die '未修改 SSH 服务配置'
-  fi
-
-  if reload_sshd; then
-    ok 'SSH 配置已生效。请使用新终端验证登录，当前会话不要关闭。'
-  else
-    warn '配置已经写入并通过 sshd -t 校验，但自动 reload 失败。请手动 reload/restart ssh 服务后再测试。'
-  fi
 }
 
 reload_sshd() {
@@ -141,63 +128,47 @@ reload_sshd() {
   fi
   return 1
 }
-root_authorized_keys_file_enabled() {
-  local files
+
+write_root_auth_config() {
+  local mode="$1" content tmp
   find_sshd
-  files="$("$SSHD_BIN" -T -f "$SSHD_MAIN" -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | awk '/^authorizedkeysfile / { $1=""; sub(/^ /, ""); print }')"
-  [[ "$files" =~ (^|[[:space:]])(\.ssh/authorized_keys|%h/\.ssh/authorized_keys)([[:space:]]|$) ]]
+  [[ -f "$SSHD_MAIN" ]] || die "未找到 SSH 主配置：$SSHD_MAIN"
+  mkdir -p -- "$SSHD_DIR"
+  DROPIN_BACKUP=''
+  [[ -f "$SSHD_DROPIN" ]] && DROPIN_BACKUP="${SSHD_DROPIN}.bak.$(date +%Y%m%d-%H%M%S)"
+  [[ -n "$DROPIN_BACKUP" ]] && cp -p -- "$SSHD_DROPIN" "$DROPIN_BACKUP"
+
+  case "$mode" in
+    key)
+      content=$'# Managed by ssh.sh\nPermitRootLogin prohibit-password\nMatch User root\n    AuthenticationMethods publickey\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PubkeyAuthentication yes\nMatch all\n'
+      ;;
+    password)
+      content=$'# Managed by ssh.sh\nPermitRootLogin yes\nMatch User root\n    AuthenticationMethods any\n    PasswordAuthentication yes\n    KbdInteractiveAuthentication no\n    PubkeyAuthentication no\nMatch all\n'
+      ;;
+    *) die '未知 root 登录模式' ;;
+  esac
+
+  tmp="$(mktemp "${SSHD_DIR}/.zhugeyusheng.XXXXXX")"
+  printf '%s' "$content" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$SSHD_DROPIN"
+  ensure_manager_include
+
+  if ! "$SSHD_BIN" -t -f "$SSHD_MAIN" || ! verify_root_auth_mode "$mode"; then
+    warn 'SSH 配置校验失败，已回滚。'
+    restore_ssh_config
+    die '未修改 SSH 登录配置'
+  fi
+
+  if reload_sshd; then
+    ok 'SSH 登录配置已生效。请使用新的终端测试后再关闭当前会话。'
+  else
+    warn '配置已通过校验，但自动 reload 失败；请手动执行 systemctl reload ssh 或 systemctl reload sshd。'
+  fi
 }
 
-ssh_self_check() {
-  local effective permit password pubkey key_files current_mode
-  clear
-  echo '================================================'
-  echo '              Root SSH 登录状态自检'
-  echo '================================================'
-  find_sshd
-  if "$SSHD_BIN" -t -f "$SSHD_MAIN"; then
-    ok 'SSH 配置检查：通过'
-  else
-    warn 'SSH 配置检查：失败，请勿切换 root 登录方式。'
-    pause
-    return
-  fi
-
-  effective="$("$SSHD_BIN" -T -f "$SSHD_MAIN" -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null || true)"
-  [[ -n "$effective" ]] || { warn '无法读取 root 的实际 SSH 配置。'; pause; return; }
-  permit="$(printf '%s\n' "$effective" | awk '$1 == "permitrootlogin" {print $2; exit}')"
-  password="$(printf '%s\n' "$effective" | awk '$1 == "passwordauthentication" {print $2; exit}')"
-  pubkey="$(printf '%s\n' "$effective" | awk '$1 == "pubkeyauthentication" {print $2; exit}')"
-  key_files="$(printf '%s\n' "$effective" | awk '/^authorizedkeysfile / { $1=""; sub(/^ /, ""); print; exit }')"
-
-  if [[ ( "$permit" == 'prohibit-password' || "$permit" == 'without-password' ) && "$password" == 'no' && "$pubkey" == 'yes' ]]; then
-    current_mode='root SSH 密钥登录'
-  elif [[ "$permit" == 'yes' && "$password" == 'yes' && "$pubkey" == 'no' ]]; then
-    current_mode='root SSH 密码登录'
-  elif [[ "$permit" == 'no' ]]; then
-    current_mode='root SSH 登录已禁止'
-  else
-    current_mode='root SSH 登录状态异常或未识别'
-  fi
-
-  echo "当前模式：$current_mode"
-  echo "公钥文件位置：${key_files:-未读取到}"
-  echo "有效 root 公钥数量：$(root_key_count)"
-
-  if root_authorized_keys_file_enabled; then
-    ok "SSH 会读取：$AUTHORIZED_KEYS"
-  else
-    warn "SSH 不会读取 $AUTHORIZED_KEYS；导入的密钥无法用于 root 登录。"
-  fi
-  if [[ -f "$AUTHORIZED_KEYS" ]]; then
-    echo "文件权限：.ssh=$(stat -c '%a' "$SSH_DIR" 2>/dev/null || echo '未知')，authorized_keys=$(stat -c '%a' "$AUTHORIZED_KEYS" 2>/dev/null || echo '未知')"
-  else
-    echo '公钥文件：尚未创建'
-  fi
-  pause
-}
 import_github_keys() {
-  local username keys_url added=0 key identity backup=''
+  local username keys_url key identity added=0
   read -r -p '请输入 GitHub 用户名（不含 @）：' username
   username="${username#@}"
   [[ "$username" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || die 'GitHub 用户名格式无效'
@@ -226,60 +197,28 @@ import_github_keys() {
   done < "$TMP_FILE"
   mv -- "$VALID_FILE" "$TMP_FILE"
   VALID_FILE=''
-  [[ -s "$TMP_FILE" ]] || die "GitHub 用户 $username 没有可用的公开 SSH 密钥"
+  [[ -s "$TMP_FILE" ]] || die "GitHub 用户 $username 没有可用公钥"
 
   mkdir -p -- "$SSH_DIR"
   touch -- "$AUTHORIZED_KEYS"
   chmod 700 "$SSH_DIR"
   chmod 600 "$AUTHORIZED_KEYS"
-
   while IFS= read -r key; do
     identity="$(printf '%s\n' "$key" | awk '{print $1 " " $2}')"
-    if awk -v wanted="$identity" 'NF >= 2 && ($1 " " $2) == wanted { found=1; exit } END { exit !found }' "$AUTHORIZED_KEYS"; then
-      warn "已存在，跳过：$(printf '%s\n' "$key" | awk '{print $1 " " substr($2,1,16) "..."}')"
-    else
-      if ((added == 0)) && [[ -s "$AUTHORIZED_KEYS" ]]; then
-        backup="${AUTHORIZED_KEYS}.bak.$(date +%Y%m%d-%H%M%S)"
-        cp -p -- "$AUTHORIZED_KEYS" "$backup"
-        info "已备份旧公钥文件：$backup"
-      fi
+    if ! awk -v wanted="$identity" 'NF >= 2 && ($1 " " $2) == wanted { found=1; exit } END { exit !found }' "$AUTHORIZED_KEYS"; then
       printf '%s\n' "$key" >> "$AUTHORIZED_KEYS"
       ((added+=1))
     fi
   done < "$TMP_FILE"
   chown root:root "$SSH_DIR" "$AUTHORIZED_KEYS"
-  ok "GitHub 公钥导入完成：新增 $added 条；当前共有 $(root_key_count) 条。"
+  ok "GitHub 公钥导入完成：新增 $added 条，当前共有 $(root_key_count) 条。"
 
   if (( $(root_key_count) > 0 )) && root_authorized_keys_file_enabled; then
-    echo
-    warn 'GitHub 公钥导入完成，正在自动切换为 root 仅密钥登录。'
-    warn '请保留当前 SSH 会话，并立即用新的 SSH 终端测试密钥登录。'
+    info '正在自动切换为 root SSH 密钥登录，并禁止 root SSH 密码登录。'
     write_root_auth_config key
   else
-    warn 'SSH 未确认读取 /root/.ssh/authorized_keys，因此没有禁止 root 密码登录。'
+    warn 'SSH 未确认读取 /root/.ssh/authorized_keys，因此未切换登录方式。'
   fi
-}
-
-key_login_menu() {
-  while true; do
-    clear
-    echo '================================================'
-    echo '             Root 密钥登录管理'
-    echo '================================================'
-    echo "当前 root 公钥数量：$(root_key_count)"
-    echo '------------------------------------------------'
-    echo '1. 从 GitHub 导入已有公钥（导入后自动启用仅密钥登录）'
-    echo '2. 查看 root 已授权公钥'
-    echo '0. 返回主菜单'
-    echo '------------------------------------------------'
-    read -r -p '请输入选择：' choice
-    case "$choice" in
-      1) import_github_keys; pause ;;
-      2) [[ -f "$AUTHORIZED_KEYS" ]] && cat "$AUTHORIZED_KEYS" || info '暂无已授权公钥'; pause ;;
-      0) return ;;
-      *) warn '无效选择'; pause ;;
-    esac
-  done
 }
 
 remove_root_public_keys() {
@@ -287,48 +226,169 @@ remove_root_public_keys() {
   rm -f -- "$AUTHORIZED_KEYS"
   ok '已删除 root 已授权公钥。'
 }
-password_login_menu() {
-  clear
-  echo '================================================'
-  echo '             Root 密码登录管理'
-  echo '================================================'
-  warn '即将启用 root SSH 密码登录，并删除 root 已授权公钥。'
-  warn '密码登录存在暴力破解风险，请设置强密码并限制防火墙来源 IP。'
-  if ! passwd root; then
-    warn 'root 密码未设置，未改变 SSH 登录方式。'
+
+root_self_check() {
+  local effective permit password pubkey key_files mode
+  print_header
+  echo '              Root SSH 登录状态自检'
+  echo '------------------------------------------------'
+  find_sshd
+  if ! "$SSHD_BIN" -t -f "$SSHD_MAIN"; then
+    warn 'SSH 配置检查失败，请勿切换登录方式。'
     pause
     return
   fi
-  write_root_auth_config password
-  remove_root_public_keys
-  ok 'root SSH 密码登录已启用，root SSH 密钥登录已禁用。'
+  ok 'SSH 配置检查：通过'
+  effective="$(root_effective_config || true)"
+  permit="$(printf '%s\n' "$effective" | awk '$1 == "permitrootlogin" {print $2; exit}')"
+  password="$(printf '%s\n' "$effective" | awk '$1 == "passwordauthentication" {print $2; exit}')"
+  pubkey="$(printf '%s\n' "$effective" | awk '$1 == "pubkeyauthentication" {print $2; exit}')"
+  key_files="$(printf '%s\n' "$effective" | awk '/^authorizedkeysfile / { $1=""; sub(/^ /, ""); print; exit }')"
+  if [[ ( "$permit" == 'prohibit-password' || "$permit" == 'without-password' ) && "$password" == 'no' && "$pubkey" == 'yes' ]]; then
+    mode='root SSH 密钥登录'
+  elif [[ "$permit" == 'yes' && "$password" == 'yes' && "$pubkey" == 'no' ]]; then
+    mode='root SSH 密码登录'
+  elif [[ "$permit" == 'no' ]]; then
+    mode='root SSH 登录已禁止'
+  else
+    mode='root SSH 登录状态异常或未识别'
+  fi
+  echo "当前模式：$mode"
+  echo "公钥文件位置：${key_files:-未读取到}"
+  echo "有效 root 公钥数量：$(root_key_count)"
+  if root_authorized_keys_file_enabled; then
+    ok "SSH 会读取：$AUTHORIZED_KEYS"
+  else
+    warn "SSH 不会读取：$AUTHORIZED_KEYS"
+  fi
+  if [[ -f "$AUTHORIZED_KEYS" ]]; then
+    echo "文件权限：.ssh=$(stat -c '%a' "$SSH_DIR" 2>/dev/null || echo '未知')，authorized_keys=$(stat -c '%a' "$AUTHORIZED_KEYS" 2>/dev/null || echo '未知')"
+  fi
   pause
+}
+
+root_login_menu() {
+  while true; do
+    print_header
+    echo '               root 登录模式'
+    echo '------------------------------------------------'
+    echo '1. 用户 root：密钥登录'
+    echo '2. 用户 root：密码登录'
+    echo '3. 自检 root SSH 认证配置'
+    echo '0. 返回主菜单'
+    echo '------------------------------------------------'
+    read -r -p '请输入选择：' choice
+    case "$choice" in
+      1) import_github_keys; pause ;;
+      2)
+        print_header
+        warn '即将启用 root SSH 密码登录，并删除 root 已授权公钥。'
+        if passwd root; then
+          write_root_auth_config password
+          remove_root_public_keys
+          ok 'root SSH 密码登录已启用，root SSH 密钥登录已禁用。'
+        else
+          warn 'root 密码未设置，未改变 SSH 登录方式。'
+        fi
+        pause ;;
+      3) root_self_check ;;
+      0) return ;;
+      *) warn '无效选择'; pause ;;
+    esac
+  done
+}
+
+backup_motd() {
+  if [[ ! -d "$MOTD_BACKUP" ]]; then
+    cp -a -- "$MOTD_DIR" "$MOTD_BACKUP"
+  fi
+  if [[ ! -e "$MOTD_STATIC_BACKUP" ]]; then
+    [[ -e "$MOTD_STATIC" ]] && cp -a -- "$MOTD_STATIC" "$MOTD_STATIC_BACKUP" || : > "$MOTD_STATIC_BACKUP"
+  fi
+}
+
+write_vps_motd() {
+  cat > "$MOTD_FILE" <<'EOF'
+#!/usr/bin/env bash
+GREEN='\033[1;32m'; CYAN='\033[1;36m'; RESET='\033[0m'
+host_name=$(hostname 2>/dev/null || printf 'VPS')
+os_name=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
+uptime_info=$(uptime -p 2>/dev/null | sed 's/^up //' || true)
+load_info=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || true)
+memory_info=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 " / " $2}' || true)
+disk_info=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 " (已用 " $5 ")"}' || true)
+ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+printf "%b" "$GREEN"
+cat <<'LOGO'
+  ███████╗██╗  ██╗██╗   ██╗ ██████╗ ███████╗
+  ╚══███╔╝██║  ██║██║   ██║██╔════╝ ██╔════╝
+    ███╔╝ ███████║██║   ██║██║  ███╗█████╗
+   ███╔╝  ██╔══██║██║   ██║██║   ██║██╔══╝
+  ███████╗██║  ██║╚██████╔╝╚██████╔╝███████╗
+  ╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝
+                 Y U S H E N G
+LOGO
+printf "%b\n" "$RESET"
+printf "%b主机：%s%b\n" "$CYAN" "$host_name" "$RESET"
+printf "系统：%s\n运行：%s\n负载：%s\n内存：%s\n磁盘：%s\n地址：%s\n\n" "${os_name:-未知}" "${uptime_info:-未知}" "${load_info:-未知}" "${memory_info:-未知}" "${disk_info:-未知}" "${ip_addr:-未知}"
+EOF
+  chmod 755 "$MOTD_FILE"
+}
+
+install_vps_logo() {
+  [[ -d "$MOTD_DIR" ]] || die "未找到 $MOTD_DIR；仅支持 Ubuntu/Debian 动态 MOTD。"
+  backup_motd
+  find "$MOTD_DIR" -maxdepth 1 -type f ! -name "$(basename "$MOTD_FILE")" -exec chmod a-x {} +
+  write_vps_motd
+  : > "$MOTD_STATIC"
+  ok 'VPS 欢迎 Logo 已启用，预览如下：'
+  echo '------------------------------------------------'
+  run-parts -- "$MOTD_DIR"
+  echo '------------------------------------------------'
+  pause
+}
+
+restore_vps_logo() {
+  [[ -d "$MOTD_BACKUP" ]] || { warn '没有找到 VPS Logo 的原 MOTD 备份。'; pause; return; }
+  rm -f -- "$MOTD_FILE"
+  find "$MOTD_DIR" -mindepth 1 -maxdepth 1 -type f -exec rm -f -- {} +
+  cp -a -- "$MOTD_BACKUP"/. "$MOTD_DIR"/
+  [[ -e "$MOTD_STATIC_BACKUP" ]] && cp -a -- "$MOTD_STATIC_BACKUP" "$MOTD_STATIC" || : > "$MOTD_STATIC"
+  ok 'Ubuntu/Debian 原欢迎界面已恢复。'
+  pause
+}
+
+logo_change_menu() {
+  while true; do
+    print_header
+    echo '                Logo 改变'
+    echo '------------------------------------------------'
+    echo '1. 启用 ZHUGEYUSHENG VPS Logo'
+    echo '2. 恢复 Ubuntu/Debian 原欢迎界面'
+    echo '0. 返回主菜单'
+    echo '------------------------------------------------'
+    read -r -p '请输入选择：' choice
+    case "$choice" in
+      1) install_vps_logo ;;
+      2) restore_vps_logo ;;
+      0) return ;;
+      *) warn '无效选择'; pause ;;
+    esac
+  done
 }
 
 main_menu() {
   require_root
   while true; do
-    clear
-    echo '================================================'
-    echo '   ███████╗██╗  ██╗██╗   ██╗ ██████╗ ███████╗'
-    echo '   ╚══███╔╝██║  ██║██║   ██║██╔════╝ ██╔════╝'
-    echo '     ███╔╝ ███████║██║   ██║██║  ███╗█████╗  '
-    echo '    ███╔╝  ██╔══██║██║   ██║██║   ██║██╔══╝  '
-    echo '   ███████╗██║  ██║╚██████╔╝╚██████╔╝███████╗'
-    echo '   ╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝'
-    echo '              Y U S H E N G'
-    echo '          ZHUGEYUSHENG SSH 登录管理'
-    echo '================================================'
-    echo '1. 用户 root：密钥登录'
-    echo '2. 用户 root：密码登录'
-    echo '3. 自检 root SSH 认证配置'
+    print_header
+    echo '1. root 登录模式'
+    echo '2. Logo 改变'
     echo '0. 退出'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
     case "$choice" in
-      1) key_login_menu ;;
-      2) password_login_menu ;;
-      3) ssh_self_check ;;
+      1) root_login_menu ;;
+      2) logo_change_menu ;;
       0) clear; exit 0 ;;
       *) warn '无效选择'; pause ;;
     esac
