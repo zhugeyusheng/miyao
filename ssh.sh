@@ -36,6 +36,7 @@ require_root() {
 cleanup() {
   [[ -n "${TMP_FILE:-}" && -f "$TMP_FILE" ]] && rm -f -- "$TMP_FILE"
   [[ -n "${VALID_FILE:-}" && -f "$VALID_FILE" ]] && rm -f -- "$VALID_FILE"
+  [[ -n "${MIGRATION_TMP_DIR:-}" && -d "$MIGRATION_TMP_DIR" ]] && rm -rf -- "$MIGRATION_TMP_DIR"
   return 0
 }
 trap cleanup EXIT
@@ -562,6 +563,316 @@ request_domain_certificate() {
   pause
 }
 
+view_domain_status() {
+  local domain resolved cert_dir http_status
+  print_header
+  echo '               查看域名情况'
+  echo '------------------------------------------------'
+  read -r -p '请输入域名（例如 example.com）：' domain
+  domain="${domain,,}"
+  domain="${domain%.}"
+  if ! domain_is_valid "$domain"; then
+    warn '域名格式无效。'
+    pause
+    return
+  fi
+
+  echo "域名：$domain"
+  if command -v getent >/dev/null 2>&1; then
+    resolved="$(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+    if [[ -n "$resolved" ]]; then
+      ok "DNS 解析：$resolved"
+    else
+      warn 'DNS 解析：本机未查询到 A 记录。'
+    fi
+  else
+    warn '未安装 getent，无法查询 DNS 解析。'
+  fi
+
+  if port_80_in_use; then
+    info '本机 80 端口：正在被服务占用。'
+  else
+    info '本机 80 端口：当前未检测到监听服务。'
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    http_status="$(curl -IL --silent --show-error --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "http://$domain" 2>/dev/null || true)"
+    if [[ "$http_status" =~ ^[1-5][0-9][0-9]$ ]]; then
+      ok "HTTP 连通性：收到 HTTP $http_status 响应。"
+    else
+      warn 'HTTP 连通性：未收到有效响应，请检查 DNS、防火墙和 Web 服务。'
+    fi
+  else
+    warn '未安装 curl，跳过 HTTP 连通性检查。'
+  fi
+
+  cert_dir="$CERT_BASE/$domain"
+  if [[ -f "$cert_dir/fullchain.pem" && -f "$cert_dir/privkey.pem" ]]; then
+    ok "已部署证书：$cert_dir"
+    if command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "$cert_dir/fullchain.pem" -noout -subject -issuer -dates 2>/dev/null || \
+        warn '证书文件无法被 OpenSSL 读取。'
+    else
+      warn '未安装 openssl，无法读取证书详情。'
+    fi
+  else
+    warn "未在 $cert_dir 找到已部署的证书。"
+  fi
+  pause
+}
+
+domain_certificate_menu() {
+  local choice
+  while true; do
+    print_header
+    echo '               域名证书管理'
+    echo '------------------------------------------------'
+    echo '1. 域名证书申请'
+    echo '2. 查看域名情况'
+    echo '0. 返回主菜单'
+    echo '------------------------------------------------'
+    read -r -p '请输入选择：' choice
+    case "$choice" in
+      1) request_domain_certificate ;;
+      2) view_domain_status ;;
+      0) return ;;
+      *) warn '无效选择'; pause ;;
+    esac
+  done
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少必要命令：$1"
+}
+
+base64_one_line() {
+  printf '%s' "$1" | base64 | tr -d '\r\n'
+}
+
+wordpress_migration() {
+  local wp_root old_url new_url target_host target_port target_user target_path target web_user
+  local db_name db_user db_pass db_host work_dir stamp bundle_name bundle_file remote_script
+  local export_file meta_file archive_file ssh_opts=() scp_opts=()
+
+  print_header
+  echo '              WordPress 网站搬家'
+  echo '------------------------------------------------'
+  warn '请保持当前 SSH 会话连接，搬家完成并测试成功后再修改 DNS。'
+  echo '本功能会迁移 WordPress 文件和数据库，并可安全替换序列化数据中的旧域名。'
+  echo '目标 VPS 需已安装：OpenSSH、tar、MySQL/MariaDB 客户端与服务端。'
+  echo '------------------------------------------------'
+
+  require_command wp
+  require_command ssh
+  require_command scp
+  require_command tar
+  require_command base64
+
+  read -r -e -p '源站 WordPress 目录（例如 /var/www/example.com）：' wp_root
+  wp_root="${wp_root%/}"
+  [[ "$wp_root" == /* && -f "$wp_root/wp-config.php" ]] || { warn '目录无效或未找到 wp-config.php。'; pause; return; }
+  if ! wp core is-installed --path="$wp_root" --allow-root >/dev/null 2>&1; then
+    warn 'WP-CLI 无法确认该目录是已安装的 WordPress 网站。'
+    pause
+    return
+  fi
+
+  old_url="$(wp option get home --path="$wp_root" --allow-root 2>/dev/null || true)"
+  [[ -n "$old_url" ]] || { warn '无法读取 WordPress 旧网址。'; pause; return; }
+  echo "检测到当前网站地址：$old_url"
+  read -r -p '新网站地址（保留原域名可直接回车，例如 https://new.example.com）：' new_url
+  new_url="${new_url:-$old_url}"
+  [[ "$new_url" =~ ^https?://[^[:space:]/]+/?$ ]] || { warn '新网站地址格式无效，请输入 http://域名 或 https://域名。'; pause; return; }
+  new_url="${new_url%/}"
+  old_url="${old_url%/}"
+
+  read -r -p '目标 VPS 地址（IPv4 或域名）：' target_host
+  [[ "$target_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { warn '目标 VPS 地址格式无效。'; pause; return; }
+  read -r -p '目标 VPS SSH 端口 [22]：' target_port
+  target_port="${target_port:-22}"
+  [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || { warn 'SSH 端口无效。'; pause; return; }
+  read -r -p '目标 VPS SSH 用户 [root]：' target_user
+  target_user="${target_user:-root}"
+  [[ "$target_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { warn 'SSH 用户名格式无效。'; pause; return; }
+  read -r -e -p '目标网站目录（例如 /var/www/example.com）：' target_path
+  target_path="${target_path%/}"
+  [[ "$target_path" =~ ^/[A-Za-z0-9._/-]+$ && "$target_path" != '/' ]] || { warn '目标目录必须是安全的绝对路径，且不能为根目录。'; pause; return; }
+  read -r -p '目标网站文件所属用户 [www-data]：' web_user
+  web_user="${web_user:-www-data}"
+  [[ "$web_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { warn '文件所属用户名格式无效。'; pause; return; }
+
+  db_name="$(wp config get DB_NAME --path="$wp_root" --allow-root 2>/dev/null || true)"
+  db_user="$(wp config get DB_USER --path="$wp_root" --allow-root 2>/dev/null || true)"
+  db_pass="$(wp config get DB_PASSWORD --path="$wp_root" --allow-root 2>/dev/null || true)"
+  db_host="$(wp config get DB_HOST --path="$wp_root" --allow-root 2>/dev/null || true)"
+  [[ "$db_name" =~ ^[A-Za-z0-9_]+$ ]] || { warn '数据库名包含不支持的字符，无法自动迁移。'; pause; return; }
+  [[ "$db_user" =~ ^[A-Za-z0-9_]+$ ]] || { warn '数据库用户名包含不支持的字符，无法自动迁移。'; pause; return; }
+  [[ "$db_pass" != *$'\n'* && "$db_pass" != *$'\r'* ]] || { warn '数据库密码包含换行符，无法安全自动迁移。'; pause; return; }
+  case "$db_host" in
+    localhost|127.0.0.1|localhost:*) ;;
+    *) warn "当前 DB_HOST=$db_host，不是本机数据库；自动建库模式不适用。"; pause; return ;;
+  esac
+
+  target="$target_user@$target_host"
+  ssh_opts=(-p "$target_port" -o ConnectTimeout=10 -o ServerAliveInterval=15)
+  scp_opts=(-P "$target_port" -o ConnectTimeout=10)
+  info "正在测试目标 VPS SSH 连接：$target"
+  if ! ssh "${ssh_opts[@]}" "$target" 'test "$(id -u)" -eq 0' ; then
+    warn '目标连接失败，或目标 SSH 用户不是 root。请先配置 SSH 登录。'
+    pause
+    return
+  fi
+
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  work_dir="$(mktemp -d)"
+  MIGRATION_TMP_DIR="$work_dir"
+  export_file="$work_dir/database.sql"
+  meta_file="$work_dir/migration.meta"
+  archive_file="$work_dir/wordpress-files.tar.gz"
+  bundle_name="wordpress-migration-$stamp.tar.gz"
+  bundle_file="$work_dir/$bundle_name"
+  remote_script="$work_dir/deploy-wordpress-$stamp.sh"
+
+  info '正在导出 WordPress 数据库…'
+  if [[ "$old_url" == "$new_url" ]]; then
+    wp db export "$export_file" --path="$wp_root" --allow-root --quiet || die '数据库导出失败。'
+  else
+    info "正在将数据库中的域名从 $old_url 安全替换为 $new_url（不会修改源站）…"
+    wp search-replace "$old_url" "$new_url" --all-tables-with-prefix --precise \
+      --export="$export_file" --path="$wp_root" --allow-root --quiet || die '数据库导出或域名替换失败。'
+  fi
+
+  info '正在打包 WordPress 文件…'
+  tar -C "$wp_root" -czf "$archive_file" . || die '网站文件打包失败。'
+  {
+    printf 'DB_NAME_B64=%s\n' "$(base64_one_line "$db_name")"
+    printf 'DB_USER_B64=%s\n' "$(base64_one_line "$db_user")"
+    printf 'DB_PASS_B64=%s\n' "$(base64_one_line "$db_pass")"
+    printf 'TARGET_PATH_B64=%s\n' "$(base64_one_line "$target_path")"
+    printf 'WEB_USER_B64=%s\n' "$(base64_one_line "$web_user")"
+    printf 'OLD_URL_B64=%s\n' "$(base64_one_line "$old_url")"
+    printf 'NEW_URL_B64=%s\n' "$(base64_one_line "$new_url")"
+  } > "$meta_file"
+  chmod 600 "$meta_file"
+  tar -C "$work_dir" -czf "$bundle_file" wordpress-files.tar.gz database.sql migration.meta || die '迁移包生成失败。'
+
+  cat > "$remote_script" <<'REMOTE_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+bundle="$1"
+script_path="${BASH_SOURCE[0]}"
+work_dir=''
+cleanup_remote() {
+  [[ -n "$work_dir" && -d "$work_dir" ]] && rm -rf -- "$work_dir"
+  [[ -f "$bundle" ]] && rm -f -- "$bundle"
+  [[ -f "$script_path" ]] && rm -f -- "$script_path"
+  return 0
+}
+trap cleanup_remote EXIT
+command -v tar >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 tar。' >&2; exit 1; }
+command -v mysql >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 mysql 客户端。' >&2; exit 1; }
+command -v php >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 PHP CLI。' >&2; exit 1; }
+command -v base64 >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 base64。' >&2; exit 1; }
+command -v gzip >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 gzip。' >&2; exit 1; }
+work_dir="$(mktemp -d)"
+tar -xzf "$bundle" -C "$work_dir"
+# shellcheck disable=SC1090
+source "$work_dir/migration.meta"
+decode() { printf '%s' "$1" | base64 -d; }
+db_name="$(decode "$DB_NAME_B64")"
+db_user="$(decode "$DB_USER_B64")"
+db_pass="$(decode "$DB_PASS_B64")"
+target_path="$(decode "$TARGET_PATH_B64")"
+web_user="$(decode "$WEB_USER_B64")"
+old_url="$(decode "$OLD_URL_B64")"
+new_url="$(decode "$NEW_URL_B64")"
+[[ "$db_name" =~ ^[A-Za-z0-9_]+$ && "$db_user" =~ ^[A-Za-z0-9_]+$ ]] || { echo '[错误] 数据库标识符无效。' >&2; exit 1; }
+[[ "$target_path" =~ ^/[A-Za-z0-9._/-]+$ && "$target_path" != '/' ]] || { echo '[错误] 目标路径无效。' >&2; exit 1; }
+id "$web_user" >/dev/null 2>&1 || { echo "[错误] 目标 VPS 不存在用户：$web_user" >&2; exit 1; }
+mysql -e 'SELECT 1' >/dev/null 2>&1 || { echo '[错误] 无法以系统 root 身份管理 MySQL/MariaDB，请先配置本机 root socket 登录。' >&2; exit 1; }
+stamp="$(date +%Y%m%d-%H%M%S)"
+backup_dir="/root/wp-migration-backups/$stamp"
+mkdir -p -- "$backup_dir"
+if [[ -d "$target_path" && -n "$(find "$target_path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+  echo "[信息] 备份目标网站现有文件到：$backup_dir/site-files.tar.gz"
+  tar -C "$target_path" -czf "$backup_dir/site-files.tar.gz" .
+fi
+if mysql -NBe "SHOW DATABASES LIKE '$db_name'" | grep -Fxq "$db_name"; then
+  command -v mysqldump >/dev/null 2>&1 || { echo '[错误] 数据库已存在，但目标 VPS 缺少 mysqldump，无法安全备份。' >&2; exit 1; }
+  echo "[信息] 备份目标数据库到：$backup_dir/database.sql.gz"
+  mysqldump --single-transaction --default-character-set=utf8mb4 "$db_name" | gzip > "$backup_dir/database.sql.gz"
+fi
+sql_pass="${db_pass//\\/\\\\}"
+sql_pass="${sql_pass//\'/\'\'}"
+mysql <<SQL
+CREATE DATABASE IF NOT EXISTS \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$db_user'@'localhost' IDENTIFIED BY '$sql_pass';
+ALTER USER '$db_user'@'localhost' IDENTIFIED BY '$sql_pass';
+GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'localhost';
+CREATE USER IF NOT EXISTS '$db_user'@'127.0.0.1' IDENTIFIED BY '$sql_pass';
+ALTER USER '$db_user'@'127.0.0.1' IDENTIFIED BY '$sql_pass';
+GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+mkdir -p -- "$target_path"
+find "$target_path" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+tar -xzf "$work_dir/wordpress-files.tar.gz" -C "$target_path"
+mysql --default-character-set=utf8mb4 "$db_name" < "$work_dir/database.sql"
+if [[ "$old_url" != "$new_url" ]]; then
+  php -r '$p=$argv[1]; $old=$argv[2]; $new=$argv[3]; $s=file_get_contents($p); if ($s === false) exit(1); if (file_put_contents($p, str_replace($old, $new, $s)) === false) exit(1);' "$target_path/wp-config.php" "$old_url" "$new_url"
+fi
+chown -R "$web_user:$web_user" "$target_path"
+find "$target_path" -type d -exec chmod 755 {} +
+find "$target_path" -type f -exec chmod 644 {} +
+chmod 640 "$target_path/wp-config.php"
+echo '[成功] WordPress 文件与数据库已迁移。'
+echo "[信息] 目标目录：$target_path"
+echo "[信息] 网站地址：$new_url"
+echo "[信息] 覆盖前备份：$backup_dir"
+echo '[提示] 请配置 Nginx/Apache 虚拟主机与 HTTPS，测试无误后再修改 DNS。'
+REMOTE_SCRIPT
+  chmod 700 "$remote_script"
+
+  echo '------------------------------------------------'
+  echo "源目录：$wp_root"
+  echo "目标：$target:$target_path"
+  echo "域名：$old_url -> $new_url"
+  warn '目标目录和同名数据库如已存在，将先备份，再由迁移内容覆盖。'
+  read -r -p '确认开始传输并部署？请输入 YES：' confirm
+  [[ "$confirm" == 'YES' ]] || { info '已取消网站搬家。'; rm -rf -- "$work_dir"; MIGRATION_TMP_DIR=''; pause; return; }
+
+  info '正在上传迁移包和部署脚本…'
+  scp "${scp_opts[@]}" "$bundle_file" "$remote_script" "$target:/tmp/" || die '上传迁移文件失败。'
+  info '正在目标 VPS 上备份现有内容并部署 WordPress…'
+  if ssh "${ssh_opts[@]}" -t "$target" "bash '/tmp/$(basename "$remote_script")' '/tmp/$bundle_name'"; then
+    ok 'WordPress 网站搬家完成。'
+    info '请先通过 hosts 文件或临时解析测试后台、文章、图片、插件和固定链接。'
+    info '确认无误后再修改 DNS，并为新域名配置 HTTPS。'
+  else
+    warn '目标 VPS 部署失败。目标端若已开始覆盖，请检查 /root/wp-migration-backups 下的备份。'
+  fi
+  rm -rf -- "$work_dir"
+  MIGRATION_TMP_DIR=''
+  pause
+}
+
+website_migration_menu() {
+  local choice
+  while true; do
+    print_header
+    echo '                网站搬家'
+    echo '------------------------------------------------'
+    echo '1. WordPress 网站迁移到另一台 VPS'
+    echo '0. 返回主菜单'
+    echo '------------------------------------------------'
+    read -r -p '请输入选择：' choice
+    case "$choice" in
+      1) wordpress_migration ;;
+      0) return ;;
+      *) warn '无效选择'; pause ;;
+    esac
+  done
+}
 main_menu() {
   require_root
   ensure_default_script_shortcut
@@ -575,7 +886,8 @@ main_menu() {
     echo '2. Logo 改变'
     echo '3. 主机用户名更改'
     echo '4. 脚本调出快捷键'
-    echo '5. 域名证书申请'
+    echo '5. 域名证书管理'
+    echo '6. 网站搬家'
     echo '0. 退出'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
@@ -584,7 +896,8 @@ main_menu() {
       2) logo_change_menu ;;
       3) change_hostname ;;
       4) install_script_shortcut ;;
-      5) request_domain_certificate ;;
+      5) domain_certificate_menu ;;
+      6) website_migration_menu ;;
       0) clear; exit 0 ;;
       *) warn '无效选择'; pause ;;
     esac
