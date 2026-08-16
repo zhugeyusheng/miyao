@@ -649,159 +649,342 @@ base64_one_line() {
   printf '%s' "$1" | base64 | tr -d '\r\n'
 }
 
+install_wordpress_stack() {
+  local need_install=0 pkg_manager='' wp_tmp='' service_name
+  for cmd in nginx mysql php tar gzip base64; do
+    command -v "$cmd" >/dev/null 2>&1 || need_install=1
+  done
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' || need_install=1
+
+  if (( need_install )); then
+    warn '检测到网站运行环境不完整，准备自动安装 Nginx、MySQL/MariaDB、PHP 和常用扩展。'
+    if command -v apt-get >/dev/null 2>&1; then
+      pkg_manager='apt'
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update || die '软件源更新失败。'
+      apt-get install -y nginx mariadb-server mariadb-client php-fpm php-mysql php-cli php-curl php-gd php-mbstring php-xml php-zip curl ca-certificates tar gzip coreutils || die '网站环境安装失败。'
+    elif command -v dnf >/dev/null 2>&1; then
+      pkg_manager='dnf'
+      dnf install -y nginx mariadb-server mariadb php-fpm php-mysqlnd php-cli php-curl php-gd php-mbstring php-xml php-zip curl ca-certificates tar gzip coreutils || die '网站环境安装失败。'
+    elif command -v yum >/dev/null 2>&1; then
+      pkg_manager='yum'
+      yum install -y nginx mariadb-server mariadb php-fpm php-mysqlnd php-cli php-curl php-gd php-mbstring php-xml php-zip curl ca-certificates tar gzip coreutils || die '网站环境安装失败。'
+    else
+      die '不支持当前系统的软件包管理器；目前支持 Ubuntu/Debian 和 RHEL/CentOS/Rocky/AlmaLinux。'
+    fi
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now nginx >/dev/null 2>&1 || warn 'Nginx 自动启动失败，请稍后手动检查。'
+    for service_name in mariadb mysql mysqld; do
+      if systemctl list-unit-files "$service_name.service" >/dev/null 2>&1; then
+        systemctl enable --now "$service_name" >/dev/null 2>&1 && break
+      fi
+    done
+    for service_name in php-fpm php8.4-fpm php8.3-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
+      if systemctl list-unit-files "$service_name.service" >/dev/null 2>&1; then
+        systemctl enable --now "$service_name" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+
+  command -v nginx >/dev/null 2>&1 || die 'Nginx 安装后仍不可用。'
+  command -v mysql >/dev/null 2>&1 || die 'MySQL/MariaDB 客户端安装后仍不可用。'
+  command -v php >/dev/null 2>&1 || die 'PHP 安装后仍不可用。'
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' || die 'PHP MySQL 扩展未正确安装。'
+
+  if ! command -v wp >/dev/null 2>&1; then
+    info '正在安装 WordPress 管理工具 WP-CLI…'
+    wp_tmp="$(mktemp)"
+    TMP_FILE="$wp_tmp"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL --silent --show-error --connect-timeout 10 --max-time 120 \
+        https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$wp_tmp" || die 'WP-CLI 下载失败。'
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q --timeout=120 -O "$wp_tmp" \
+        https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar || die 'WP-CLI 下载失败。'
+    else
+      die '缺少 curl 或 wget，无法安装 WP-CLI。'
+    fi
+    php "$wp_tmp" --info >/dev/null 2>&1 || die '下载的 WP-CLI 文件校验失败。'
+    install -m 755 "$wp_tmp" /usr/local/bin/wp || die 'WP-CLI 安装失败。'
+    rm -f -- "$wp_tmp"
+    TMP_FILE=''
+  fi
+  ok '网站运行环境检查完成。'
+}
+
+import_wordpress_package() {
+  local package_file extract_dir import_file choice index
+  local -a packages=()
+  print_header
+  echo '            导入 WordPress 迁移包'
+  echo '------------------------------------------------'
+  echo '脚本会自动扫描迁移包，并安装缺少的 Nginx、MySQL/MariaDB、PHP 和 WP-CLI。'
+  info '正在扫描 VPS 文件系统中的 WordPress 迁移包…'
+  mapfile -t packages < <(find / \
+    \( -path /proc -o -path /sys -o -path /dev -o -path /run \
+       -o -path /snap -o -path /lost+found \) -prune -o \
+    -type f \( -name 'wordpress-migration-*.tar.gz' -o -name 'wordpress-migration-*.tgz' \) -print \
+    2>/dev/null | sort -u)
+
+  if (( ${#packages[@]} > 0 )); then
+    echo '发现以下迁移包：'
+    for index in "${!packages[@]}"; do
+      printf '  %d. %s（%s）\n' "$((index + 1))" "${packages[$index]}" "$(du -h "${packages[$index]}" 2>/dev/null | awk '{print $1}')"
+    done
+    echo '  M. 手动输入其他路径'
+    read -r -p '请选择迁移包编号 [1]：' choice
+    choice="${choice:-1}"
+    if [[ "$choice" =~ ^[Mm]$ ]]; then
+      read -r -e -p '请输入迁移包完整路径：' package_file
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#packages[@]} )); then
+      package_file="${packages[$((choice - 1))]}"
+    else
+      warn '选择无效。'
+      pause
+      return
+    fi
+  else
+    warn '没有扫描到标准命名的迁移包。'
+    read -r -e -p '请输入迁移包完整路径，或按 Enter 返回：' package_file
+    [[ -n "$package_file" ]] || return
+  fi
+  [[ -f "$package_file" ]] || { warn '没有找到迁移包文件。'; pause; return; }
+  case "$package_file" in
+    *.tar.gz|*.tgz) ;;
+    *) warn '迁移包必须是 .tar.gz 或 .tgz 文件。'; pause; return ;;
+  esac
+
+  install_wordpress_stack
+  if tar -tzf "$package_file" | awk 'BEGIN { bad=0 } /(^|\/)\.\.($|\/)|^\// { bad=1 } END { exit !bad }'; then
+    warn '迁移包包含不安全路径，拒绝解压。'
+    pause
+    return
+  fi
+  extract_dir="$(mktemp -d)"
+  MIGRATION_TMP_DIR="$extract_dir"
+  tar -xzf "$package_file" -C "$extract_dir" || die '迁移包解压失败。'
+  import_file="$(find "$extract_dir" -maxdepth 2 -type f -name import-wordpress.sh -print -quit)"
+  [[ -n "$import_file" ]] || die '迁移包中没有找到 import-wordpress.sh。'
+  chmod 700 "$import_file"
+  if bash "$import_file"; then
+    ok '迁移包导入流程执行完成。'
+  else
+    warn '迁移包导入失败，请根据上方错误信息检查。'
+  fi
+  rm -rf -- "$extract_dir"
+  MIGRATION_TMP_DIR=''
+  pause
+}
+
 wordpress_migration() {
-  local wp_root old_url new_url target_host target_port target_user target_path target web_user
-  local db_name db_user db_pass db_host work_dir stamp bundle_name bundle_file remote_script
-  local export_file meta_file archive_file ssh_opts=() scp_opts=()
+  local wp_root output_dir stamp package_dir package_file files_archive db_dump meta_file import_script
+  local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port
+  local mysql_args=() confirm
 
   print_header
-  echo '              WordPress 网站搬家'
+  echo '           WordPress 离线搬家包生成'
   echo '------------------------------------------------'
-  warn '请保持当前 SSH 会话连接，搬家完成并测试成功后再修改 DNS。'
-  echo '本功能会迁移 WordPress 文件和数据库，并可安全替换序列化数据中的旧域名。'
-  echo '目标 VPS 需已安装：OpenSSH、tar、MySQL/MariaDB 客户端与服务端。'
+  echo '本功能只在当前 VPS 生成迁移包，不会连接另一台 VPS。'
+  echo '生成后请自行下载迁移包，再上传到目标 VPS 执行其中的导入脚本。'
+  echo '迁移包包含：网站文件、数据库、导入工具和安全换域名功能。'
   echo '------------------------------------------------'
 
-  require_command wp
-  require_command ssh
-  require_command scp
+  require_command php
+  require_command mysqldump
+  require_command mysql
   require_command tar
   require_command base64
 
-  read -r -e -p '源站 WordPress 目录（例如 /var/www/example.com）：' wp_root
+  read -r -e -p 'WordPress 网站目录（例如 /var/www/example.com）：' wp_root
   wp_root="${wp_root%/}"
   [[ "$wp_root" == /* && -f "$wp_root/wp-config.php" ]] || { warn '目录无效或未找到 wp-config.php。'; pause; return; }
-  if ! wp core is-installed --path="$wp_root" --allow-root >/dev/null 2>&1; then
-    warn 'WP-CLI 无法确认该目录是已安装的 WordPress 网站。'
-    pause
-    return
-  fi
 
-  old_url="$(wp option get home --path="$wp_root" --allow-root 2>/dev/null || true)"
-  [[ -n "$old_url" ]] || { warn '无法读取 WordPress 旧网址。'; pause; return; }
-  echo "检测到当前网站地址：$old_url"
-  read -r -p '新网站地址（保留原域名可直接回车，例如 https://new.example.com）：' new_url
-  new_url="${new_url:-$old_url}"
-  [[ "$new_url" =~ ^https?://[^[:space:]/]+/?$ ]] || { warn '新网站地址格式无效，请输入 http://域名 或 https://域名。'; pause; return; }
-  new_url="${new_url%/}"
-  old_url="${old_url%/}"
+  info '正在读取 wp-config.php 数据库配置…'
+  mapfile -t wp_config_values < <(php -r '
+    $s = file_get_contents($argv[1]);
+    if ($s === false) exit(1);
+    foreach (["DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST"] as $name) {
+      $pattern = "/define\\s*\\(\\s*[\\x27\\x22]" . preg_quote($name, "/") . "[\\x27\\x22]\\s*,\\s*[\\x27\\x22]((?:\\\\.|[^\\x27\\x22])*)[\\x27\\x22]\\s*\\)/";
+      if (!preg_match($pattern, $s, $m)) exit(2);
+      echo stripcslashes($m[1]), "\n";
+    }
+    if (!preg_match("/\\\$table_prefix\\s*=\\s*[\\x27\\x22]([A-Za-z0-9_]+)[\\x27\\x22]\\s*;/", $s, $m)) exit(3);
+    echo $m[1], "\n";
+  ' "$wp_root/wp-config.php") || { warn '无法解析 wp-config.php；目前支持 WordPress 标准 define 配置格式。'; pause; return; }
 
-  read -r -p '目标 VPS 地址（IPv4 或域名）：' target_host
-  [[ "$target_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { warn '目标 VPS 地址格式无效。'; pause; return; }
-  read -r -p '目标 VPS SSH 端口 [22]：' target_port
-  target_port="${target_port:-22}"
-  [[ "$target_port" =~ ^[0-9]+$ ]] && (( target_port >= 1 && target_port <= 65535 )) || { warn 'SSH 端口无效。'; pause; return; }
-  read -r -p '目标 VPS SSH 用户 [root]：' target_user
-  target_user="${target_user:-root}"
-  [[ "$target_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { warn 'SSH 用户名格式无效。'; pause; return; }
-  read -r -e -p '目标网站目录（例如 /var/www/example.com）：' target_path
-  target_path="${target_path%/}"
-  [[ "$target_path" =~ ^/[A-Za-z0-9._/-]+$ && "$target_path" != '/' ]] || { warn '目标目录必须是安全的绝对路径，且不能为根目录。'; pause; return; }
-  read -r -p '目标网站文件所属用户 [www-data]：' web_user
-  web_user="${web_user:-www-data}"
-  [[ "$web_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { warn '文件所属用户名格式无效。'; pause; return; }
+  (( ${#wp_config_values[@]} == 5 )) || { warn '读取到的 WordPress 数据库配置不完整。'; pause; return; }
+  db_name="${wp_config_values[0]}"
+  db_user="${wp_config_values[1]}"
+  db_pass="${wp_config_values[2]}"
+  db_host="${wp_config_values[3]}"
+  table_prefix="${wp_config_values[4]}"
+  [[ "$db_name" =~ ^[A-Za-z0-9_]+$ && "$db_user" =~ ^[A-Za-z0-9_]+$ && "$table_prefix" =~ ^[A-Za-z0-9_]+$ ]] || { warn '数据库名、用户名或表前缀包含不支持的字符。'; pause; return; }
+  [[ "$db_pass" != *$'\n'* && "$db_pass" != *$'\r'* ]] || { warn '数据库密码包含换行符，无法安全生成迁移包。'; pause; return; }
 
-  db_name="$(wp config get DB_NAME --path="$wp_root" --allow-root 2>/dev/null || true)"
-  db_user="$(wp config get DB_USER --path="$wp_root" --allow-root 2>/dev/null || true)"
-  db_pass="$(wp config get DB_PASSWORD --path="$wp_root" --allow-root 2>/dev/null || true)"
-  db_host="$(wp config get DB_HOST --path="$wp_root" --allow-root 2>/dev/null || true)"
-  [[ "$db_name" =~ ^[A-Za-z0-9_]+$ ]] || { warn '数据库名包含不支持的字符，无法自动迁移。'; pause; return; }
-  [[ "$db_user" =~ ^[A-Za-z0-9_]+$ ]] || { warn '数据库用户名包含不支持的字符，无法自动迁移。'; pause; return; }
-  [[ "$db_pass" != *$'\n'* && "$db_pass" != *$'\r'* ]] || { warn '数据库密码包含换行符，无法安全自动迁移。'; pause; return; }
+  db_host_name="$db_host"
+  db_port=''
   case "$db_host" in
-    localhost|127.0.0.1|localhost:*) ;;
-    *) warn "当前 DB_HOST=$db_host，不是本机数据库；自动建库模式不适用。"; pause; return ;;
+    localhost:*) db_host_name='localhost'; db_port="${db_host#localhost:}" ;;
+    *:*) db_host_name="${db_host%%:*}"; db_port="${db_host##*:}" ;;
   esac
+  mysql_args=(-h "$db_host_name" -u "$db_user")
+  [[ -n "$db_port" && "$db_port" =~ ^[0-9]+$ ]] && mysql_args+=(-P "$db_port")
 
-  target="$target_user@$target_host"
-  ssh_opts=(-p "$target_port" -o ConnectTimeout=10 -o ServerAliveInterval=15)
-  scp_opts=(-P "$target_port" -o ConnectTimeout=10)
-  info "正在测试目标 VPS SSH 连接：$target"
-  if ! ssh "${ssh_opts[@]}" "$target" 'test "$(id -u)" -eq 0' ; then
-    warn '目标连接失败，或目标 SSH 用户不是 root。请先配置 SSH 登录。'
+  if ! MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe 'SELECT 1' "$db_name" >/dev/null 2>&1; then
+    warn '无法连接 WordPress 数据库，请检查 wp-config.php 中的数据库配置。'
     pause
     return
   fi
+  old_url="$(MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe "SELECT option_value FROM ${table_prefix}options WHERE option_name='home' LIMIT 1" "$db_name" 2>/dev/null || true)"
+  [[ -n "$old_url" ]] || old_url="$(MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe "SELECT option_value FROM ${table_prefix}options WHERE option_name='siteurl' LIMIT 1" "$db_name" 2>/dev/null || true)"
+  echo "检测到网站地址：${old_url:-未读取到，导入时可手动填写}"
+
+  read -r -e -p '迁移包保存目录 [/root]：' output_dir
+  output_dir="${output_dir:-/root}"
+  [[ "$output_dir" == /* ]] || { warn '保存目录必须是绝对路径。'; pause; return; }
+  mkdir -p -- "$output_dir" || { warn '无法创建保存目录。'; pause; return; }
 
   stamp="$(date +%Y%m%d-%H%M%S)"
-  work_dir="$(mktemp -d)"
-  MIGRATION_TMP_DIR="$work_dir"
-  export_file="$work_dir/database.sql"
-  meta_file="$work_dir/migration.meta"
-  archive_file="$work_dir/wordpress-files.tar.gz"
-  bundle_name="wordpress-migration-$stamp.tar.gz"
-  bundle_file="$work_dir/$bundle_name"
-  remote_script="$work_dir/deploy-wordpress-$stamp.sh"
+  package_dir="$(mktemp -d)"
+  MIGRATION_TMP_DIR="$package_dir"
+  files_archive="$package_dir/wordpress-files.tar.gz"
+  db_dump="$package_dir/database.sql"
+  meta_file="$package_dir/migration.meta"
+  import_script="$package_dir/import-wordpress.sh"
+  package_file="$output_dir/wordpress-migration-$stamp.tar.gz"
 
-  info '正在导出 WordPress 数据库…'
-  if [[ "$old_url" == "$new_url" ]]; then
-    wp db export "$export_file" --path="$wp_root" --allow-root --quiet || die '数据库导出失败。'
-  else
-    info "正在将数据库中的域名从 $old_url 安全替换为 $new_url（不会修改源站）…"
-    wp search-replace "$old_url" "$new_url" --all-tables-with-prefix --precise \
-      --export="$export_file" --path="$wp_root" --allow-root --quiet || die '数据库导出或域名替换失败。'
-  fi
+  echo '------------------------------------------------'
+  echo "网站目录：$wp_root"
+  echo "数据库：$db_name"
+  echo "输出文件：$package_file"
+  read -r -p '确认生成完整迁移包？请输入 YES：' confirm
+  [[ "$confirm" == 'YES' ]] || { info '已取消。'; rm -rf -- "$package_dir"; MIGRATION_TMP_DIR=''; pause; return; }
 
+  info '正在导出数据库…'
+  MYSQL_PWD="$db_pass" mysqldump "${mysql_args[@]}" --single-transaction --quick --default-character-set=utf8mb4 \
+    --triggers "$db_name" > "$db_dump" || die '数据库导出失败。'
   info '正在打包 WordPress 文件…'
-  tar -C "$wp_root" -czf "$archive_file" . || die '网站文件打包失败。'
+  tar -C "$wp_root" -czf "$files_archive" . || die '网站文件打包失败。'
+
   {
     printf 'DB_NAME_B64=%s\n' "$(base64_one_line "$db_name")"
     printf 'DB_USER_B64=%s\n' "$(base64_one_line "$db_user")"
     printf 'DB_PASS_B64=%s\n' "$(base64_one_line "$db_pass")"
-    printf 'TARGET_PATH_B64=%s\n' "$(base64_one_line "$target_path")"
-    printf 'WEB_USER_B64=%s\n' "$(base64_one_line "$web_user")"
     printf 'OLD_URL_B64=%s\n' "$(base64_one_line "$old_url")"
-    printf 'NEW_URL_B64=%s\n' "$(base64_one_line "$new_url")"
   } > "$meta_file"
   chmod 600 "$meta_file"
-  tar -C "$work_dir" -czf "$bundle_file" wordpress-files.tar.gz database.sql migration.meta || die '迁移包生成失败。'
 
-  cat > "$remote_script" <<'REMOTE_SCRIPT'
+  cat > "$import_script" <<'IMPORT_SCRIPT'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-bundle="$1"
-script_path="${BASH_SOURCE[0]}"
-work_dir=''
-cleanup_remote() {
-  [[ -n "$work_dir" && -d "$work_dir" ]] && rm -rf -- "$work_dir"
-  [[ -f "$bundle" ]] && rm -f -- "$bundle"
-  [[ -f "$script_path" ]] && rm -f -- "$script_path"
-  return 0
+GREEN='\033[1;32m'; CYAN='\033[1;36m'; YELLOW='\033[1;33m'; RED='\033[1;31m'; RESET='\033[0m'
+info() { printf "%b[信息]%b %s\n" "$CYAN" "$RESET" "$*"; }
+ok() { printf "%b[成功]%b %s\n" "$GREEN" "$RESET" "$*"; }
+warn() { printf "%b[警告]%b %s\n" "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf "%b[错误]%b %s\n" "$RED" "$RESET" "$*" >&2; exit 1; }
+[[ ${EUID:-$(id -u)} -eq 0 ]] || die '请使用 root 权限运行导入脚本。'
+auto_install_stack() {
+  local missing=0 service_name wp_tmp
+  for cmd in nginx mysql php tar gzip base64; do command -v "$cmd" >/dev/null 2>&1 || missing=1; done
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' || missing=1
+  if (( missing )); then
+    warn '检测到运行环境不完整，正在自动安装 Nginx、MySQL/MariaDB、PHP 和扩展…'
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update || die '软件源更新失败。'
+      apt-get install -y nginx mariadb-server mariadb-client php-fpm php-mysql php-cli php-curl php-gd php-mbstring php-xml php-zip curl ca-certificates tar gzip coreutils || die '环境安装失败。'
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y nginx mariadb-server mariadb php-fpm php-mysqlnd php-cli php-curl php-gd php-mbstring php-xml php-zip curl ca-certificates tar gzip coreutils || die '环境安装失败。'
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y nginx mariadb-server mariadb php-fpm php-mysqlnd php-cli php-curl php-gd php-mbstring php-xml php-zip curl ca-certificates tar gzip coreutils || die '环境安装失败。'
+    else
+      die '无法自动安装：仅支持 Ubuntu/Debian 和 RHEL/CentOS/Rocky/AlmaLinux。'
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now nginx >/dev/null 2>&1 || warn 'Nginx 启动失败。'
+    for service_name in mariadb mysql mysqld; do
+      systemctl enable --now "$service_name" >/dev/null 2>&1 && break || true
+    done
+    for service_name in php-fpm php8.4-fpm php8.3-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
+      systemctl enable --now "$service_name" >/dev/null 2>&1 || true
+    done
+  fi
+  for cmd in nginx mysql php tar gzip base64; do command -v "$cmd" >/dev/null 2>&1 || die "安装后仍缺少命令：$cmd"; done
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' || die 'PHP MySQL 扩展未正确安装。'
+  if ! command -v wp >/dev/null 2>&1; then
+    info '正在安装 WordPress 管理工具 WP-CLI…'
+    wp_tmp="$(mktemp)"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL --silent --show-error --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$wp_tmp" || die 'WP-CLI 下载失败。'
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q --timeout=120 -O "$wp_tmp" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar || die 'WP-CLI 下载失败。'
+    else
+      die '缺少 curl 或 wget，无法安装 WP-CLI。'
+    fi
+    php "$wp_tmp" --info >/dev/null 2>&1 || die 'WP-CLI 文件校验失败。'
+    install -m 755 "$wp_tmp" /usr/local/bin/wp || die 'WP-CLI 安装失败。'
+    rm -f -- "$wp_tmp"
+  fi
+  ok 'Nginx、数据库、PHP 和 WP-CLI 环境检查完成。'
 }
-trap cleanup_remote EXIT
-command -v tar >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 tar。' >&2; exit 1; }
-command -v mysql >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 mysql 客户端。' >&2; exit 1; }
-command -v php >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 PHP CLI。' >&2; exit 1; }
-command -v base64 >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 base64。' >&2; exit 1; }
-command -v gzip >/dev/null 2>&1 || { echo '[错误] 目标 VPS 缺少 gzip。' >&2; exit 1; }
-work_dir="$(mktemp -d)"
-tar -xzf "$bundle" -C "$work_dir"
-# shellcheck disable=SC1090
-source "$work_dir/migration.meta"
+auto_install_stack
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$script_dir/migration.meta" && -f "$script_dir/database.sql" && -f "$script_dir/wordpress-files.tar.gz" ]] || die '迁移包文件不完整。'
+for cmd in mysql tar base64 php gzip; do command -v "$cmd" >/dev/null 2>&1 || die "目标 VPS 缺少命令：$cmd"; done
+# migration.meta 由源 VPS 脚本生成，只包含 Base64 数据。
+# shellcheck disable=SC1091
+source "$script_dir/migration.meta"
 decode() { printf '%s' "$1" | base64 -d; }
 db_name="$(decode "$DB_NAME_B64")"
 db_user="$(decode "$DB_USER_B64")"
 db_pass="$(decode "$DB_PASS_B64")"
-target_path="$(decode "$TARGET_PATH_B64")"
-web_user="$(decode "$WEB_USER_B64")"
 old_url="$(decode "$OLD_URL_B64")"
-new_url="$(decode "$NEW_URL_B64")"
-[[ "$db_name" =~ ^[A-Za-z0-9_]+$ && "$db_user" =~ ^[A-Za-z0-9_]+$ ]] || { echo '[错误] 数据库标识符无效。' >&2; exit 1; }
-[[ "$target_path" =~ ^/[A-Za-z0-9._/-]+$ && "$target_path" != '/' ]] || { echo '[错误] 目标路径无效。' >&2; exit 1; }
-id "$web_user" >/dev/null 2>&1 || { echo "[错误] 目标 VPS 不存在用户：$web_user" >&2; exit 1; }
-mysql -e 'SELECT 1' >/dev/null 2>&1 || { echo '[错误] 无法以系统 root 身份管理 MySQL/MariaDB，请先配置本机 root socket 登录。' >&2; exit 1; }
+[[ "$db_name" =~ ^[A-Za-z0-9_]+$ && "$db_user" =~ ^[A-Za-z0-9_]+$ ]] || die '迁移包中的数据库标识符无效。'
+[[ "$db_pass" != *$'\n'* && "$db_pass" != *$'\r'* ]] || die '数据库密码格式不受支持。'
+
+read -r -e -p '目标网站目录（例如 /var/www/example.com）：' target_path
+target_path="${target_path%/}"
+[[ "$target_path" =~ ^/[A-Za-z0-9._/-]+$ && "$target_path" != '/' ]] || die '目标网站目录必须是安全的绝对路径，且不能为根目录。'
+default_web_user='www-data'
+if ! id www-data >/dev/null 2>&1; then
+  if id apache >/dev/null 2>&1; then default_web_user='apache'; else default_web_user='nginx'; fi
+fi
+read -r -p "网站文件所属用户 [$default_web_user]：" web_user
+web_user="${web_user:-$default_web_user}"
+[[ "$web_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || die '用户名称格式无效。'
+id "$web_user" >/dev/null 2>&1 || die "目标 VPS 不存在用户：$web_user"
+echo "原网站地址：${old_url:-未知}"
+read -r -p '新网站地址（不换域名直接回车）：' new_url
+new_url="${new_url:-$old_url}"
+if [[ -n "$new_url" ]]; then
+  [[ "$new_url" =~ ^https?://[^[:space:]/]+/?$ ]] || die '新网站地址格式无效。'
+  new_url="${new_url%/}"
+fi
+old_url="${old_url%/}"
+
+mysql -e 'SELECT 1' >/dev/null 2>&1 || die '无法以系统 root 管理 MySQL/MariaDB，请先配置 root 本地 socket 登录。'
 stamp="$(date +%Y%m%d-%H%M%S)"
 backup_dir="/root/wp-migration-backups/$stamp"
 mkdir -p -- "$backup_dir"
 if [[ -d "$target_path" && -n "$(find "$target_path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-  echo "[信息] 备份目标网站现有文件到：$backup_dir/site-files.tar.gz"
+  info "正在备份目标目录到 $backup_dir/site-files.tar.gz"
   tar -C "$target_path" -czf "$backup_dir/site-files.tar.gz" .
 fi
 if mysql -NBe "SHOW DATABASES LIKE '$db_name'" | grep -Fxq "$db_name"; then
-  command -v mysqldump >/dev/null 2>&1 || { echo '[错误] 数据库已存在，但目标 VPS 缺少 mysqldump，无法安全备份。' >&2; exit 1; }
-  echo "[信息] 备份目标数据库到：$backup_dir/database.sql.gz"
+  command -v mysqldump >/dev/null 2>&1 || die '数据库已存在，但缺少 mysqldump，无法安全备份。'
+  info "正在备份目标数据库到 $backup_dir/database.sql.gz"
   mysqldump --single-transaction --default-character-set=utf8mb4 "$db_name" | gzip > "$backup_dir/database.sql.gz"
 fi
+
+echo "目标目录：$target_path"
+echo "新网站地址：${new_url:-保持数据库原值}"
+warn '目标目录和同名数据库将先备份，再由迁移内容覆盖。'
+read -r -p '确认导入？请输入 YES：' confirm
+[[ "$confirm" == 'YES' ]] || die '已取消导入。'
+
 sql_pass="${db_pass//\\/\\\\}"
 sql_pass="${sql_pass//\'/\'\'}"
 mysql <<SQL
@@ -816,43 +999,100 @@ FLUSH PRIVILEGES;
 SQL
 mkdir -p -- "$target_path"
 find "$target_path" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-tar -xzf "$work_dir/wordpress-files.tar.gz" -C "$target_path"
-mysql --default-character-set=utf8mb4 "$db_name" < "$work_dir/database.sql"
-if [[ "$old_url" != "$new_url" ]]; then
+tar -xzf "$script_dir/wordpress-files.tar.gz" -C "$target_path"
+mysql --default-character-set=utf8mb4 "$db_name" < "$script_dir/database.sql"
+
+if [[ -n "$old_url" && -n "$new_url" && "$old_url" != "$new_url" ]]; then
+  wp_cmd=''
+  if command -v wp >/dev/null 2>&1; then
+    wp_cmd="$(command -v wp)"
+  else
+    info '目标 VPS 未安装 WP-CLI，正在下载临时 WP-CLI 以安全替换序列化数据…'
+    wp_cmd="$(mktemp)"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL --silent --show-error --connect-timeout 10 --max-time 120 https://github.com/wp-cli/wp-cli/releases/latest/download/wp-cli.phar -o "$wp_cmd" || die 'WP-CLI 下载失败。'
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q --timeout=120 -O "$wp_cmd" https://github.com/wp-cli/wp-cli/releases/latest/download/wp-cli.phar || die 'WP-CLI 下载失败。'
+    else
+      die '目标 VPS 缺少 wp、curl 和 wget，无法安全更换域名。'
+    fi
+    chmod 700 "$wp_cmd"
+  fi
+  info "正在安全替换域名：$old_url -> $new_url"
+  php "$wp_cmd" search-replace "$old_url" "$new_url" --all-tables-with-prefix --precise --path="$target_path" --allow-root || die '域名替换失败。'
   php -r '$p=$argv[1]; $old=$argv[2]; $new=$argv[3]; $s=file_get_contents($p); if ($s === false) exit(1); if (file_put_contents($p, str_replace($old, $new, $s)) === false) exit(1);' "$target_path/wp-config.php" "$old_url" "$new_url"
 fi
 chown -R "$web_user:$web_user" "$target_path"
 find "$target_path" -type d -exec chmod 755 {} +
 find "$target_path" -type f -exec chmod 644 {} +
 chmod 640 "$target_path/wp-config.php"
-echo '[成功] WordPress 文件与数据库已迁移。'
-echo "[信息] 目标目录：$target_path"
-echo "[信息] 网站地址：$new_url"
-echo "[信息] 覆盖前备份：$backup_dir"
-echo '[提示] 请配置 Nginx/Apache 虚拟主机与 HTTPS，测试无误后再修改 DNS。'
-REMOTE_SCRIPT
-  chmod 700 "$remote_script"
-
-  echo '------------------------------------------------'
-  echo "源目录：$wp_root"
-  echo "目标：$target:$target_path"
-  echo "域名：$old_url -> $new_url"
-  warn '目标目录和同名数据库如已存在，将先备份，再由迁移内容覆盖。'
-  read -r -p '确认开始传输并部署？请输入 YES：' confirm
-  [[ "$confirm" == 'YES' ]] || { info '已取消网站搬家。'; rm -rf -- "$work_dir"; MIGRATION_TMP_DIR=''; pause; return; }
-
-  info '正在上传迁移包和部署脚本…'
-  scp "${scp_opts[@]}" "$bundle_file" "$remote_script" "$target:/tmp/" || die '上传迁移文件失败。'
-  info '正在目标 VPS 上备份现有内容并部署 WordPress…'
-  if ssh "${ssh_opts[@]}" -t "$target" "bash '/tmp/$(basename "$remote_script")' '/tmp/$bundle_name'"; then
-    ok 'WordPress 网站搬家完成。'
-    info '请先通过 hosts 文件或临时解析测试后台、文章、图片、插件和固定链接。'
-    info '确认无误后再修改 DNS，并为新域名配置 HTTPS。'
+site_host=''
+[[ -n "$new_url" ]] && site_host="$(php -r '$h=parse_url($argv[1], PHP_URL_HOST); if ($h) echo strtolower($h);' "$new_url" 2>/dev/null || true)"
+if [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+  php_socket=''
+  shopt -s nullglob
+  for socket_candidate in /run/php/php*-fpm.sock /run/php-fpm/www.sock; do
+    [[ -S "$socket_candidate" ]] && { php_socket="$socket_candidate"; break; }
+  done
+  shopt -u nullglob
+  nginx_config="/etc/nginx/conf.d/wordpress-${site_host//./-}.conf"
+  if [[ -n "$php_socket" ]]; then
+    fastcgi_target="unix:$php_socket"
   else
-    warn '目标 VPS 部署失败。目标端若已开始覆盖，请检查 /root/wp-migration-backups 下的备份。'
+    fastcgi_target='127.0.0.1:9000'
   fi
-  rm -rf -- "$work_dir"
+  cat > "$nginx_config" <<NGINX_CONFIG
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $site_host;
+    root $target_path;
+    index index.php index.html;
+    client_max_body_size 128m;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+    location ~ \.php$ {
+        include /etc/nginx/fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_pass $fastcgi_target;
+    }
+    location ~* /\.(?!well-known/) {
+        deny all;
+    }
+}
+NGINX_CONFIG
+  if nginx -t; then
+    if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload; fi
+    ok "Nginx 网站配置已生成：$nginx_config"
+  else
+    rm -f -- "$nginx_config"
+    warn 'Nginx 配置校验失败，已删除新配置；网站文件和数据库不受影响。'
+  fi
+else
+  warn '未取得有效网站域名，跳过自动生成 Nginx 网站配置。'
+fi
+ok 'WordPress 文件和数据库导入完成。'
+echo "目标目录：$target_path"
+echo "网站地址：${new_url:-数据库原值}"
+echo "覆盖前备份：$backup_dir"
+warn 'Nginx HTTP 配置已自动处理；请配置 HTTPS，测试无误后再修改 DNS。'
+IMPORT_SCRIPT
+  chmod 700 "$import_script"
+
+  tar -C "$package_dir" -czf "$package_file" wordpress-files.tar.gz database.sql migration.meta import-wordpress.sh || die '最终迁移包生成失败。'
+  chmod 600 "$package_file"
+  rm -rf -- "$package_dir"
   MIGRATION_TMP_DIR=''
+
+  ok 'WordPress 离线迁移包已生成。'
+  echo "迁移包：$package_file"
+  echo '目标 VPS 导入步骤：'
+  echo "  1. 将 $(basename "$package_file") 上传到目标 VPS"
+  echo "  2. mkdir -p /root/wp-import && tar -xzf $(basename "$package_file") -C /root/wp-import"
+  echo '  3. bash /root/wp-import/import-wordpress.sh'
+  info '导入脚本会询问目标目录、文件用户和新域名。'
   pause
 }
 
@@ -862,12 +1102,14 @@ website_migration_menu() {
     print_header
     echo '                网站搬家'
     echo '------------------------------------------------'
-    echo '1. WordPress 网站迁移到另一台 VPS'
+    echo '1. 生成 WordPress 离线迁移包'
+    echo '2. 导入 WordPress 迁移包（自动安装环境）'
     echo '0. 返回主菜单'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
     case "$choice" in
       1) wordpress_migration ;;
+      2) import_wordpress_package ;;
       0) return ;;
       *) warn '无效选择'; pause ;;
     esac
