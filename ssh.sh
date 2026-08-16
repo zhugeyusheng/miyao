@@ -14,6 +14,9 @@ MOTD_FILE="$MOTD_DIR/01-zhugeyusheng-vps"
 MOTD_STATIC='/etc/motd'
 MOTD_STATIC_BACKUP='/etc/motd.zhugeyusheng-backup'
 
+ACME_HOME='/root/.acme.sh'
+CERT_BASE='/etc/ssl/zhugeyusheng'
+
 GREEN='\033[1;32m'
 CYAN='\033[1;36m'
 YELLOW='\033[1;33m'
@@ -457,6 +460,117 @@ change_hostname() {
   info '重新登录 SSH 后会显示新的主机名。'
   pause
 }
+
+domain_is_valid() {
+  local domain="$1"
+  [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
+}
+
+port_80_in_use() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk 'NR > 1 && $4 ~ /:80$/ { found=1 } END { exit !found }'
+    return
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk '$4 ~ /:80$/ { found=1 } END { exit !found }'
+    return
+  fi
+  return 1
+}
+
+install_acme_sh() {
+  local email="$1" installer
+  [[ -x "$ACME_HOME/acme.sh" ]] && return 0
+  info '正在安装 acme.sh（用于申请和自动续期证书）。'
+  installer="$(mktemp)"
+  TMP_FILE="$installer"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --silent --show-error --connect-timeout 10 --max-time 60 https://get.acme.sh -o "$installer" || die 'acme.sh 下载失败，请检查网络连接。'
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=60 -O "$installer" https://get.acme.sh || die 'acme.sh 下载失败，请检查网络连接。'
+  else
+    die '系统中未找到 curl 或 wget，无法安装 acme.sh。'
+  fi
+  sh "$installer" "email=$email" || die 'acme.sh 安装失败。'
+  rm -f -- "$installer"
+  TMP_FILE=''
+  [[ -x "$ACME_HOME/acme.sh" ]] || die 'acme.sh 安装后未找到可执行文件。'
+}
+
+request_domain_certificate() {
+  local domain email cert_dir reload_cmd resolved
+  print_header
+  echo '               域名证书申请'
+  echo '------------------------------------------------'
+  echo "使用 Let's Encrypt 的 HTTP-01 standalone 验证。"
+  echo '申请前请确认：域名 A/AAAA 记录指向本机，且公网 80 端口可访问。'
+  read -r -p '请输入域名（例如 example.com）：' domain
+  domain="${domain,,}"
+  domain="${domain%.}"
+  if ! domain_is_valid "$domain"; then
+    warn '域名格式无效；仅支持普通域名，不支持通配符证书。'
+    pause
+    return
+  fi
+
+  if port_80_in_use; then
+    warn '检测到 80 端口正在被占用。为避免中断现有网站，本功能不会停止服务。'
+    info '请先停止占用 80 端口的服务后重试，或改用 Webroot/DNS 验证方式。'
+    pause
+    return
+  fi
+
+  resolved=''
+  if command -v getent >/dev/null 2>&1; then
+    resolved="$(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+  fi
+  if [[ -n "$resolved" ]]; then
+    info "检测到域名解析：$resolved"
+  else
+    warn '未能在本机查询到该域名的 A 记录；若 DNS 刚变更，可稍后重试。'
+  fi
+
+  read -r -p '请输入证书到期提醒邮箱：' email
+  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
+    warn '邮箱格式无效。'
+    pause
+    return
+  }
+
+  cert_dir="$CERT_BASE/$domain"
+  read -r -p "续期后重载命令（可留空；例如 systemctl reload nginx）：" reload_cmd
+  install_acme_sh "$email"
+  "$ACME_HOME/acme.sh" --set-default-ca --server letsencrypt >/dev/null || die "无法设置 Let's Encrypt 为证书颁发机构。"
+  "$ACME_HOME/acme.sh" --register-account -m "$email" --server letsencrypt >/dev/null 2>&1 || \
+    warn '提醒邮箱注册未确认；若此前已注册账户可继续申请。'
+  info "正在为 $domain 申请 ECC 证书…"
+  if ! "$ACME_HOME/acme.sh" --issue --standalone -d "$domain" --keylength ec-256; then
+    warn '证书申请失败。请检查 DNS 是否指向本机、防火墙/安全组是否放行 80 端口，以及 80 端口是否空闲。'
+    pause
+    return
+  fi
+
+  mkdir -p -- "$cert_dir"
+  chmod 700 "$cert_dir"
+  if [[ -n "$reload_cmd" ]]; then
+    "$ACME_HOME/acme.sh" --install-cert -d "$domain" --ecc \
+      --key-file "$cert_dir/privkey.pem" \
+      --fullchain-file "$cert_dir/fullchain.pem" \
+      --reloadcmd "$reload_cmd" || die '证书已签发，但部署失败。'
+  else
+    "$ACME_HOME/acme.sh" --install-cert -d "$domain" --ecc \
+      --key-file "$cert_dir/privkey.pem" \
+      --fullchain-file "$cert_dir/fullchain.pem" || die '证书已签发，但部署失败。'
+  fi
+  chmod 600 "$cert_dir/privkey.pem"
+  chmod 644 "$cert_dir/fullchain.pem"
+  ok '域名证书申请并部署完成，acme.sh 已自动配置续期任务。'
+  echo "私钥：$cert_dir/privkey.pem"
+  echo "完整证书链：$cert_dir/fullchain.pem"
+  [[ -n "$reload_cmd" ]] || info '未设置续期后的重载命令；请在 Web 服务中引用证书后，按需重新申请并设置该命令。'
+  pause
+}
+
 main_menu() {
   require_root
   ensure_default_script_shortcut
@@ -470,6 +584,7 @@ main_menu() {
     echo '2. Logo 改变'
     echo '3. 主机用户名更改'
     echo '4. 脚本调出快捷键'
+    echo '5. 域名证书申请'
     echo '0. 退出'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
@@ -478,6 +593,7 @@ main_menu() {
       2) logo_change_menu ;;
       3) change_hostname ;;
       4) install_script_shortcut ;;
+      5) request_domain_certificate ;;
       0) clear; exit 0 ;;
       *) warn '无效选择'; pause ;;
     esac
