@@ -479,7 +479,7 @@ port_80_in_use() {
 }
 
 install_acme_sh() {
-  local email="$1" installer
+  local installer
   [[ -x "$ACME_HOME/acme.sh" ]] && return 0
   info '正在安装 acme.sh（用于申请和自动续期证书）。'
   installer="$(mktemp)"
@@ -491,14 +491,14 @@ install_acme_sh() {
   else
     die '系统中未找到 curl 或 wget，无法安装 acme.sh。'
   fi
-  sh "$installer" "email=$email" || die 'acme.sh 安装失败。'
+  sh "$installer" || die 'acme.sh 安装失败。'
   rm -f -- "$installer"
   TMP_FILE=''
   [[ -x "$ACME_HOME/acme.sh" ]] || die 'acme.sh 安装后未找到可执行文件。'
 }
 
 request_domain_certificate() {
-  local domain email cert_dir reload_cmd resolved
+  local domain cert_dir reload_cmd resolved
   print_header
   echo '               域名证书申请'
   echo '------------------------------------------------'
@@ -530,19 +530,10 @@ request_domain_certificate() {
     warn '未能在本机查询到该域名的 A 记录；若 DNS 刚变更，可稍后重试。'
   fi
 
-  read -r -p '请输入证书到期提醒邮箱：' email
-  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
-    warn '邮箱格式无效。'
-    pause
-    return
-  }
-
   cert_dir="$CERT_BASE/$domain"
   read -r -p "续期后重载命令（可留空；例如 systemctl reload nginx）：" reload_cmd
-  install_acme_sh "$email"
+  install_acme_sh
   "$ACME_HOME/acme.sh" --set-default-ca --server letsencrypt >/dev/null || die "无法设置 Let's Encrypt 为证书颁发机构。"
-  "$ACME_HOME/acme.sh" --register-account -m "$email" --server letsencrypt >/dev/null 2>&1 || \
-    warn '提醒邮箱注册未确认；若此前已注册账户可继续申请。'
   info "正在为 $domain 申请 ECC 证书…"
   if ! "$ACME_HOME/acme.sh" --issue --standalone -d "$domain" --keylength ec-256; then
     warn '证书申请失败。请检查 DNS 是否指向本机、防火墙/安全组是否放行 80 端口，以及 80 端口是否空闲。'
