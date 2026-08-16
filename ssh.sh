@@ -377,18 +377,46 @@ logo_change_menu() {
   done
 }
 
+change_hostname() {
+  local current new_name
+  print_header
+  echo '             主机用户名更改'
+  echo '------------------------------------------------'
+  current="$(hostname 2>/dev/null || printf '未知')"
+  echo "当前主机名：$current"
+  read -r -p '请输入新的主机名：' new_name
+  new_name="${new_name,,}"
+
+  if [[ ! "$new_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$ ]]; then
+    warn '主机名格式无效：只能使用小写字母、数字、连字符和点，且不能以连字符开头或结尾。'
+    pause
+    return
+  fi
+
+  if command -v hostnamectl >/dev/null 2>&1; then
+    hostnamectl set-hostname "$new_name"
+  else
+    printf '%s\n' "$new_name" > /etc/hostname
+    hostname "$new_name" 2>/dev/null || true
+  fi
+  ok "主机名已修改为：$new_name"
+  info '重新登录 SSH 后会显示新的主机名。'
+  pause
+}
 main_menu() {
   require_root
   while true; do
     print_header
     echo '1. root 登录模式'
     echo '2. Logo 改变'
+    echo '3. 主机用户名更改'
     echo '0. 退出'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
     case "$choice" in
       1) root_login_menu ;;
       2) logo_change_menu ;;
+      3) change_hostname ;;
       0) clear; exit 0 ;;
       *) warn '无效选择'; pause ;;
     esac
