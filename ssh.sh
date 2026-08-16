@@ -377,15 +377,9 @@ logo_change_menu() {
   done
 }
 
-install_script_shortcut() {
-  local key lower upper rc_file tmp begin end
-  print_header
-  echo '             脚本调出快捷键'
-  echo '------------------------------------------------'
-  echo '设置后，在 root 终端直接输入一个字母即可调出本脚本。'
-  read -r -p '请输入一个英文字母作为快捷键：' key
-  [[ "$key" =~ ^[A-Za-z]$ ]] || { warn '只能输入一个英文字母。'; pause; return; }
-
+set_script_shortcut() {
+  local key="$1" lower upper rc_file tmp begin end
+  [[ "$key" =~ ^[A-Za-z]$ ]] || return 1
   lower="${key,,}"
   upper="${key^^}"
   rc_file='/root/.bashrc'
@@ -394,7 +388,7 @@ install_script_shortcut() {
   touch "$rc_file"
   tmp="$(mktemp)"
 
-  # 移除旧快捷键区块，再写入新的大小写快捷键；不会覆盖其他 .bashrc 内容。
+  # 只替换本脚本创建的区块，不影响用户其余 .bashrc 配置。
   awk -v begin="$begin" -v end="$end" '
     $0 == begin { skip=1; next }
     $0 == end { skip=0; next }
@@ -408,7 +402,32 @@ alias $upper='bash <(curl -fsSL https://ssh.126260.xyz)'
 $end
 EOF
   mv -f -- "$tmp" "$rc_file"
-  ok "快捷键已设置：输入 $lower 或 $upper 即可调出脚本。"
+}
+
+ensure_default_script_shortcut() {
+  local begin='# >>> ZHUGEYUSHENG SSH 快捷键 >>>'
+  DEFAULT_SHORTCUT_CREATED=0
+  if ! grep -Fqx "$begin" /root/.bashrc 2>/dev/null; then
+    set_script_shortcut s || die '无法设置默认脚本快捷键。'
+    DEFAULT_SHORTCUT_CREATED=1
+  fi
+}
+
+install_script_shortcut() {
+  local key lower upper
+  print_header
+  echo '             脚本调出快捷键'
+  echo '------------------------------------------------'
+  echo '默认快捷键为 s / S；此处可修改为其他单个英文字母。'
+  read -r -p '请输入新的英文字母快捷键：' key
+  if ! set_script_shortcut "$key"; then
+    warn '只能输入一个英文字母。'
+    pause
+    return
+  fi
+  lower="${key,,}"
+  upper="${key^^}"
+  ok "快捷键已修改：输入 $lower 或 $upper 即可调出脚本。"
   info '退出本脚本后执行：source /root/.bashrc；或重新连接 SSH 后生效。'
   pause
 }
@@ -440,8 +459,13 @@ change_hostname() {
 }
 main_menu() {
   require_root
+  ensure_default_script_shortcut
   while true; do
     print_header
+    if [[ ${DEFAULT_SHORTCUT_CREATED:-0} -eq 1 ]]; then
+      ok '已设置默认快捷键：s / S（重新连接 SSH 或执行 source /root/.bashrc 后生效）'
+      DEFAULT_SHORTCUT_CREATED=0
+    fi
     echo '1. root 登录模式'
     echo '2. Logo 改变'
     echo '3. 主机用户名更改'
