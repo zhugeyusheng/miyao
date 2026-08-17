@@ -1617,11 +1617,14 @@ delete_domain_and_clear_cache() {
     done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
   done
   mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
-  (( ${#domains[@]} > 0 )) || { warn '没有扫描到可删除的网站域名。'; pause; return; }
   if [[ -n "${DELETE_DOMAIN_TARGET:-}" ]]; then
     domain="$DELETE_DOMAIN_TARGET"
     unset DELETE_DOMAIN_TARGET
+    if (( ${#domains[@]} == 0 )); then
+      mapfile -t configs < <(grep -RIl --exclude='*.bak*' -E "server_name[[:space:]].*${domain}" /etc/nginx /home/web/conf.d 2>/dev/null || true)
+    fi
   else
+    (( ${#domains[@]} > 0 )) || { warn '没有扫描到可删除的网站域名。'; pause; return; }
     for index in "${!domains[@]}"; do printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"; done
     read -r -p '请选择要删除的域名编号：' choice
     [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )) || { warn '选择无效。'; pause; return; }
@@ -1635,6 +1638,15 @@ delete_domain_and_clear_cache() {
       break
     fi
   done
+  if [[ -z "$config_file" ]]; then
+    mapfile -t configs < <(grep -RIl --exclude='*.bak*' -E "server_name[[:space:]].*${domain}" /etc/nginx /home/web/conf.d 2>/dev/null || true)
+    for config_candidate in "${configs[@]}"; do
+      if awk -v wanted="$domain" '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); if ($i == wanted) found=1 } } END { exit !found }' "$config_candidate"; then
+        config_file="$config_candidate"
+        break
+      fi
+    done
+  fi
   [[ -n "$config_file" ]] || { warn "未找到域名配置：$domain"; pause; return; }
   root_dir="$(awk '$1 == "root" { gsub(";", "", $2); print $2; exit }' "$config_file")"
   [[ "$root_dir" == /* && "$root_dir" != '/' ]] || root_dir=''
