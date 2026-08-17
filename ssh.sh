@@ -586,6 +586,27 @@ view_domain_status() {
       done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
     done
   fi
+  if (( ${#domains[@]} == 0 )); then
+    # 部分面板使用域名作为配置文件名，文件内容不一定有标准 server_name 行。
+    while IFS= read -r config_file; do
+      domain="$(basename -- "$config_file")"
+      domain="${domain%.conf}"
+      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
+    done < <(find /home/web/conf.d /www/server/panel/vhost/nginx /www/server/panel/vhost/openresty \
+      /usr/local/openresty/nginx/conf /www/server/nginx/conf -maxdepth 2 -type f 2>/dev/null)
+  fi
+  if (( ${#domains[@]} == 0 )); then
+    # 最后扫描常见挂载目录中的所有文本配置，覆盖自定义面板路径。
+    mapfile -t broad_configs < <(grep -RIl --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev \
+      --exclude-dir=run --exclude-dir=cache --exclude='*.log' --exclude='*.sql' \
+      -E '(^|[[:space:]])server_name[[:space:]]' \
+      /etc /home /www /data /opt /srv /var/www /usr/local /root /mnt /media 2>/dev/null || true)
+    for config_file in "${broad_configs[@]}"; do
+      while IFS= read -r domain; do
+        [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
+      done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file" 2>/dev/null)
+    done
+  fi
   mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
   if (( ${#domains[@]} > 0 )); then
     echo '发现以下域名：'
