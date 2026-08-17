@@ -806,7 +806,7 @@ install_migration_source_tools() {
 
 wordpress_migration() {
   local wp_root output_dir stamp package_dir package_file files_archive db_dump meta_file import_script
-  local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port
+  local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port db_socket db_error socket_candidate
   local mysql_args=() confirm choice index config_file
   local -a wp_roots=()
 
@@ -879,15 +879,50 @@ wordpress_migration() {
 
   db_host_name="$db_host"
   db_port=''
+  db_socket=''
   case "$db_host" in
-    localhost:*) db_host_name='localhost'; db_port="${db_host#localhost:}" ;;
-    *:*) db_host_name="${db_host%%:*}"; db_port="${db_host##*:}" ;;
+    localhost:/*)
+      db_host_name='localhost'
+      db_socket="${db_host#localhost:}"
+      mysql_args=(-u "$db_user" -S "$db_socket")
+      ;;
+    localhost)
+      mysql_args=(-u "$db_user")
+      ;;
+    *:[0-9]*)
+      db_host_name="${db_host%%:*}"
+      db_port="${db_host##*:}"
+      mysql_args=(-h "$db_host_name" -u "$db_user" -P "$db_port" --protocol=TCP)
+      ;;
+    *)
+      mysql_args=(-h "$db_host_name" -u "$db_user")
+      ;;
   esac
-  mysql_args=(-h "$db_host_name" -u "$db_user")
-  [[ -n "$db_port" && "$db_port" =~ ^[0-9]+$ ]] && mysql_args+=(-P "$db_port")
 
-  if ! MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe 'SELECT 1' "$db_name" >/dev/null 2>&1; then
-    warn '无法连接 WordPress 数据库，请检查 wp-config.php 中的数据库配置。'
+  db_error=''
+  if ! db_error="$(MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+    # 某些面板在 wp-config.php 中写 localhost，但 MySQL 使用非默认 Socket。
+    if [[ "$db_host" == 'localhost' || "$db_host" == '127.0.0.1' ]]; then
+      for socket_candidate in /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /var/lib/mysql/mysql.sock /tmp/mysql.sock; do
+        [[ -S "$socket_candidate" ]] || continue
+        if db_error="$(MYSQL_PWD="$db_pass" mysql -u "$db_user" -S "$socket_candidate" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+          db_socket="$socket_candidate"
+          mysql_args=(-u "$db_user" -S "$db_socket")
+          db_error=''
+          info "已自动通过 MySQL Socket 连接：$db_socket"
+          break
+        fi
+      done
+    fi
+  fi
+  if [[ -n "$db_error" ]]; then
+    warn '无法连接 WordPress 数据库。'
+    echo "数据库名称：$db_name"
+    echo "数据库用户：$db_user"
+    echo "数据库地址：$db_host"
+    printf '%s\n' "$db_error" >&2
+    info '如果该 WordPress 使用 Docker/容器数据库，请确认 DB_HOST 能从当前 VPS 系统访问。'
+    info '也可以返回后选择列表中的另一个 WordPress 网站。'
     pause
     return
   fi
