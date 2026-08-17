@@ -807,8 +807,9 @@ install_migration_source_tools() {
 wordpress_migration() {
   local wp_root output_dir stamp package_dir package_file files_archive db_dump meta_file import_script
   local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port db_socket db_error socket_candidate
+  local port_candidate host_candidate container_id detected=0
   local mysql_args=() confirm choice index config_file
-  local -a wp_roots=()
+  local -a wp_roots=() socket_candidates=() port_candidates=() host_candidates=()
 
   print_header
   echo '           WordPress 离线搬家包生成'
@@ -900,28 +901,74 @@ wordpress_migration() {
   esac
 
   db_error=''
-  if ! db_error="$(MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
-    # 某些面板在 wp-config.php 中写 localhost，但 MySQL 使用非默认 Socket。
-    if [[ "$db_host" == 'localhost' || "$db_host" == '127.0.0.1' ]]; then
-      for socket_candidate in /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /var/lib/mysql/mysql.sock /tmp/mysql.sock; do
-        [[ -S "$socket_candidate" ]] || continue
-        if db_error="$(MYSQL_PWD="$db_pass" mysql -u "$db_user" -S "$socket_candidate" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
-          db_socket="$socket_candidate"
-          mysql_args=(-u "$db_user" -S "$db_socket")
+  if db_error="$(MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+    detected=1
+    info "已按 wp-config.php 配置连接数据库：$db_host"
+  fi
+
+  # 自动扫描系统中的全部 MySQL/MariaDB Unix Socket。
+  if (( detected == 0 )); then
+    mapfile -t socket_candidates < <(find /run /var/run /var/lib /tmp /opt /www -type s \
+      \( -name 'mysql.sock' -o -name 'mysqld.sock' -o -name 'mariadb.sock' \) 2>/dev/null | sort -u)
+    for socket_candidate in "${socket_candidates[@]}"; do
+      if db_error="$(MYSQL_PWD="$db_pass" mysql -u "$db_user" -S "$socket_candidate" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+        db_socket="$socket_candidate"
+        mysql_args=(-u "$db_user" -S "$db_socket")
+        db_error=''
+        detected=1
+        info "已自动发现数据库 Socket：$db_socket"
+        break
+      fi
+    done
+  fi
+
+  # 自动扫描本机正在监听的 MySQL 常用及实际 TCP 端口。
+  if (( detected == 0 )); then
+    port_candidates=(3306 3307 3308)
+    if command -v ss >/dev/null 2>&1; then
+      while IFS= read -r port_candidate; do
+        [[ "$port_candidate" =~ ^[0-9]+$ ]] && port_candidates+=("$port_candidate")
+      done < <(ss -ltnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' | sort -nu)
+    fi
+    mapfile -t port_candidates < <(printf '%s\n' "${port_candidates[@]}" | awk '/^[0-9]+$/ && !seen[$0]++')
+    for host_candidate in 127.0.0.1 localhost; do
+      for port_candidate in "${port_candidates[@]}"; do
+        if db_error="$(MYSQL_PWD="$db_pass" mysql -h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+          mysql_args=(-h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user")
           db_error=''
-          info "已自动通过 MySQL Socket 连接：$db_socket"
-          break
+          detected=1
+          info "已自动发现数据库 TCP 地址：$host_candidate:$port_candidate"
+          break 2
         fi
       done
-    fi
+    done
   fi
-  if [[ -n "$db_error" ]]; then
+
+  # WordPress 和数据库由 Docker 部署时，扫描所有运行中容器的内部 IP。
+  if (( detected == 0 )) && command -v docker >/dev/null 2>&1; then
+    mapfile -t host_candidates < <(docker ps -q 2>/dev/null | while IFS= read -r container_id; do
+      docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$container_id" 2>/dev/null
+    done | awk 'NF && !seen[$0]++')
+    for host_candidate in "${host_candidates[@]}"; do
+      for port_candidate in 3306 3307; do
+        if db_error="$(MYSQL_PWD="$db_pass" mysql -h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+          mysql_args=(-h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user")
+          db_error=''
+          detected=1
+          info "已自动发现 Docker 数据库：$host_candidate:$port_candidate"
+          break 2
+        fi
+      done
+    done
+  fi
+
+  if (( detected == 0 )); then
     warn '无法连接 WordPress 数据库。'
     echo "数据库名称：$db_name"
     echo "数据库用户：$db_user"
     echo "数据库地址：$db_host"
     printf '%s\n' "$db_error" >&2
-    info '如果该 WordPress 使用 Docker/容器数据库，请确认 DB_HOST 能从当前 VPS 系统访问。'
+    info '已自动尝试配置地址、系统 Socket、本机监听端口和 Docker 容器 IP。'
     info '也可以返回后选择列表中的另一个 WordPress 网站。'
     pause
     return
