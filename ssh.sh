@@ -805,7 +805,7 @@ install_migration_source_tools() {
 }
 
 wordpress_migration() {
-  local wp_root output_dir stamp package_dir package_file files_archive db_dump meta_file import_script
+  local wp_root output_dir stamp package_dir package_file files_archive db_dump dump_error meta_file import_script dump_bin
   local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port db_socket db_error socket_candidate
   local port_candidate host_candidate container_id detected=0
   local mysql_args=() dump_args=() confirm choice index config_file arg
@@ -993,6 +993,7 @@ wordpress_migration() {
   MIGRATION_TMP_DIR="$package_dir"
   files_archive="$package_dir/wordpress-files.tar.gz"
   db_dump="$package_dir/database.sql"
+  dump_error="$package_dir/database-dump.stderr"
   meta_file="$package_dir/migration.meta"
   import_script="$package_dir/import-wordpress.sh"
   package_file="$output_dir/wordpress-migration-$stamp.tar.gz"
@@ -1010,8 +1011,19 @@ wordpress_migration() {
   for arg in "${mysql_args[@]}"; do
     [[ "$arg" == --connect-timeout=* ]] || dump_args+=("$arg")
   done
-  MYSQL_PWD="$db_pass" mysqldump "${dump_args[@]}" --single-transaction --quick --no-tablespaces \
-    --default-character-set=utf8mb4 --triggers "$db_name" > "$db_dump" || die '数据库导出失败。'
+  dump_bin='mysqldump'
+  command -v mariadb-dump >/dev/null 2>&1 && dump_bin='mariadb-dump'
+  info "数据库导出工具：$dump_bin（已禁用 tablespace 导出）"
+  if ! MYSQL_PWD="$db_pass" "$dump_bin" "${dump_args[@]}" --single-transaction --quick --no-tablespaces \
+    --default-character-set=utf8mb4 --triggers "$db_name" > "$db_dump" 2> "$dump_error"; then
+    [[ -s "$dump_error" ]] && cat "$dump_error" >&2
+    die '数据库导出失败。'
+  fi
+  if grep -Eqi 'PROCESS privilege|tablespaces?' "$dump_error"; then
+    cat "$dump_error" >&2
+    die '数据库客户端仍尝试读取 tablespace，已停止生成迁移包；请确认 VPS 使用的是最新脚本。'
+  fi
+  [[ -s "$dump_error" ]] && warn "数据库导出提示：$(tr '\n' ' ' < "$dump_error")"
   [[ -s "$db_dump" ]] || die '数据库导出文件为空，已停止生成迁移包。'
   grep -Eq '^(CREATE TABLE|INSERT INTO|-- Table structure for table)' "$db_dump" || \
     die '数据库导出内容不完整，已停止生成迁移包。'
