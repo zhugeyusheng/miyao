@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ssh.sh - ZHUGEYUSHENG root SSH 登录与 VPS Logo 管理
 set -Eeuo pipefail
+SCRIPT_VERSION='20260817.01'
+SCRIPT_UPDATE_URL='https://ssh.126260.xyz'
 
 SSH_DIR='/root/.ssh'
 AUTHORIZED_KEYS="$SSH_DIR/authorized_keys"
@@ -28,6 +30,47 @@ ok() { printf "%b[成功]%b %s\n" "$GREEN" "$RESET" "$*"; }
 warn() { printf "%b[警告]%b %s\n" "$YELLOW" "$RESET" "$*" >&2; }
 die() { printf "%b[错误]%b %s\n" "$RED" "$RESET" "$*" >&2; exit 1; }
 pause() { read -r -p '按 Enter 返回…' _; }
+
+check_script_update_status() {
+  local remote_file remote_version
+  print_header
+  echo '              检测脚本更新状态'
+  echo '------------------------------------------------'
+  echo "当前脚本版本：$SCRIPT_VERSION"
+  echo "更新地址：$SCRIPT_UPDATE_URL"
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    warn '缺少 curl 或 wget，无法检测远程脚本。'
+    pause
+    return
+  fi
+  remote_file="$(mktemp)"
+  TMP_FILE="$remote_file"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --silent --show-error --connect-timeout 10 --max-time 30 "$SCRIPT_UPDATE_URL" -o "$remote_file" || {
+      warn '无法访问远程脚本，请检查网络或更新地址。'
+      pause
+      return
+    }
+  else
+    wget -q --timeout=30 -O "$remote_file" "$SCRIPT_UPDATE_URL" || {
+      warn '无法访问远程脚本，请检查网络或更新地址。'
+      pause
+      return
+    }
+  fi
+  remote_version="$(sed -n "s/^SCRIPT_VERSION=['\"]\([^'\"]*\)['\"]$/\1/p" "$remote_file" | head -n1)"
+  if [[ -z "$remote_version" ]]; then
+    warn '远程脚本没有版本标识，当前发布地址可能仍是旧版脚本。'
+  elif [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+    ok "当前已是最新版本：$remote_version"
+  else
+    warn "发现脚本版本差异：当前 $SCRIPT_VERSION，远程 $remote_version。"
+    info '重新执行快捷键 s / S，或重新下载脚本即可使用远程版本。'
+  fi
+  rm -f -- "$remote_file"
+  TMP_FILE=''
+  pause
+}
 
 require_root() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 权限运行：sudo bash $0"
@@ -1636,6 +1679,7 @@ main_menu() {
     echo '4. 脚本调出快捷键'
     echo '5. 域名证书管理'
     echo '6. 网站搬家'
+    echo '00. 检测脚本更新状态'
     echo '0. 退出'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
@@ -1646,6 +1690,7 @@ main_menu() {
       4) install_script_shortcut ;;
       5) domain_certificate_menu ;;
       6) website_migration_menu ;;
+      00) check_script_update_status ;;
       0) clear; exit 0 ;;
       *) warn '无效选择'; pause ;;
     esac
