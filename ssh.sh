@@ -586,22 +586,17 @@ view_domain_status() {
     for index in "${!domains[@]}"; do
       printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"
     done
-    echo '  D. 删除域名并清理缓存'
-    echo '  M. 手动输入域名'
     read -r -p '请选择域名编号 [1]：' choice
     choice="${choice:-1}"
-    if [[ "$choice" =~ ^[Dd]$ ]]; then
-      delete_domain_and_clear_cache
-      return
-    elif [[ "$choice" =~ ^[Mm]$ ]]; then
-      read -r -p '请输入域名：' domain
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )); then
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )); then
       domain="${domains[$((choice - 1))]}"
     else
       warn '选择无效。'
       pause
       return
     fi
+    DELETE_DOMAIN_TARGET="$domain" delete_domain_and_clear_cache
+    return
   else
     info '当前没有扫描到已配置的域名。'
     pause
@@ -1537,7 +1532,7 @@ website_status() {
   echo '                网站状态'
   echo '------------------------------------------------'
   mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
-    -maxdepth 2 -type f -name '*.conf' 2>/dev/null | sort -u)
+    -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | sort -u)
   for config_file in "${configs[@]}"; do
     while IFS= read -r site_host; do
       [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && sites+=("$site_host")
@@ -1623,10 +1618,15 @@ delete_domain_and_clear_cache() {
   done
   mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
   (( ${#domains[@]} > 0 )) || { warn '没有扫描到可删除的网站域名。'; pause; return; }
-  for index in "${!domains[@]}"; do printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"; done
-  read -r -p '请选择要删除的域名编号：' choice
-  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )) || { warn '选择无效。'; pause; return; }
-  domain="${domains[$((choice - 1))]}"
+  if [[ -n "${DELETE_DOMAIN_TARGET:-}" ]]; then
+    domain="$DELETE_DOMAIN_TARGET"
+    unset DELETE_DOMAIN_TARGET
+  else
+    for index in "${!domains[@]}"; do printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"; done
+    read -r -p '请选择要删除的域名编号：' choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )) || { warn '选择无效。'; pause; return; }
+    domain="${domains[$((choice - 1))]}"
+  fi
 
   config_file=''
   for config_candidate in "${configs[@]}"; do
