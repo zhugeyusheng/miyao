@@ -577,16 +577,20 @@ view_domain_status() {
       [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
     done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
   done
-  mapfile -t domains < <(printf '%s\n' "${domains[@]}" | sort -u)
+  mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
   if (( ${#domains[@]} > 0 )); then
     echo '发现以下域名：'
     for index in "${!domains[@]}"; do
       printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"
     done
+    echo '  D. 删除域名并清理缓存'
     echo '  M. 手动输入域名'
     read -r -p '请选择域名编号 [1]：' choice
     choice="${choice:-1}"
-    if [[ "$choice" =~ ^[Mm]$ ]]; then
+    if [[ "$choice" =~ ^[Dd]$ ]]; then
+      delete_domain_and_clear_cache
+      return
+    elif [[ "$choice" =~ ^[Mm]$ ]]; then
       read -r -p '请输入域名：' domain
     elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )); then
       domain="${domains[$((choice - 1))]}"
@@ -596,9 +600,9 @@ view_domain_status() {
       return
     fi
   else
-    warn '没有自动扫描到域名。'
-    read -r -p '请输入域名，或按 Enter 返回：' domain
-    [[ -n "$domain" ]] || return
+    info '当前没有扫描到已配置的域名。'
+    pause
+    return
   fi
   domain="${domain,,}"
   domain="${domain%.}"
@@ -1614,7 +1618,7 @@ delete_domain_and_clear_cache() {
       [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
     done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
   done
-  mapfile -t domains < <(printf '%s\n' "${domains[@]}" | sort -u)
+  mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
   (( ${#domains[@]} > 0 )) || { warn '没有扫描到可删除的网站域名。'; pause; return; }
   for index in "${!domains[@]}"; do printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"; done
   read -r -p '请选择要删除的域名编号：' choice
