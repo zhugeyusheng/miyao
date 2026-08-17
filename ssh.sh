@@ -570,9 +570,15 @@ view_domain_status() {
   echo '               查看域名情况'
   echo '------------------------------------------------'
   info '正在自动扫描 Nginx 网站域名…'
-  mapfile -t domains < <(nginx -T 2>/dev/null | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
+  if command -v nginx >/dev/null 2>&1; then
+    mapfile -t domains < <(nginx -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
+  elif command -v openresty >/dev/null 2>&1; then
+    mapfile -t domains < <(openresty -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
+  fi
   if (( ${#domains[@]} == 0 )); then
     mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
+      /www/server/panel/vhost/nginx /www/server/panel/vhost/openresty \
+      /usr/local/openresty/nginx/conf /www/server/nginx/conf \
       -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | sort -u)
     for config_file in "${configs[@]}"; do
       while IFS= read -r domain; do
@@ -1531,8 +1537,10 @@ website_status() {
   print_header
   echo '                网站状态'
   echo '------------------------------------------------'
-  mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
-    -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | sort -u)
+    mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
+      /www/server/panel/vhost/nginx /www/server/panel/vhost/openresty \
+      /usr/local/openresty/nginx/conf /www/server/nginx/conf \
+      -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | sort -u)
   for config_file in "${configs[@]}"; do
     while IFS= read -r site_host; do
       [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && sites+=("$site_host")
