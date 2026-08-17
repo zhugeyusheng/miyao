@@ -1010,8 +1010,11 @@ wordpress_migration() {
   for arg in "${mysql_args[@]}"; do
     [[ "$arg" == --connect-timeout=* ]] || dump_args+=("$arg")
   done
-  MYSQL_PWD="$db_pass" mysqldump "${dump_args[@]}" --single-transaction --quick --default-character-set=utf8mb4 \
-    --triggers "$db_name" > "$db_dump" || die '数据库导出失败。'
+  MYSQL_PWD="$db_pass" mysqldump "${dump_args[@]}" --single-transaction --quick --no-tablespaces \
+    --default-character-set=utf8mb4 --triggers "$db_name" > "$db_dump" || die '数据库导出失败。'
+  [[ -s "$db_dump" ]] || die '数据库导出文件为空，已停止生成迁移包。'
+  grep -Eq '^(CREATE TABLE|INSERT INTO|-- Table structure for table)' "$db_dump" || \
+    die '数据库导出内容不完整，已停止生成迁移包。'
   info '正在打包 WordPress 文件…'
   tar -C "$wp_root" -czf "$files_archive" . || die '网站文件打包失败。'
 
