@@ -778,6 +778,32 @@ import_wordpress_package() {
   pause
 }
 
+install_migration_source_tools() {
+  local missing=0
+  for cmd in php mysql mysqldump tar gzip base64; do
+    command -v "$cmd" >/dev/null 2>&1 || missing=1
+  done
+  (( missing == 0 )) && { ok '迁移包生成工具检查完成。'; return 0; }
+
+  warn '检测到迁移包生成工具不完整，正在自动安装缺少的软件。'
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update || die '软件源更新失败，请检查 VPS 网络和软件源。'
+    apt-get install -y php-cli mariadb-client tar gzip coreutils || die '迁移工具安装失败。'
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y php-cli mariadb tar gzip coreutils || die '迁移工具安装失败。'
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y php-cli mariadb tar gzip coreutils || die '迁移工具安装失败。'
+  else
+    die '无法自动安装：目前仅支持 Ubuntu/Debian 和 RHEL/CentOS/Rocky/AlmaLinux。'
+  fi
+
+  for cmd in php mysql mysqldump tar gzip base64; do
+    command -v "$cmd" >/dev/null 2>&1 || die "自动安装后仍缺少命令：$cmd"
+  done
+  ok '迁移包生成所需工具已自动安装完成。'
+}
+
 wordpress_migration() {
   local wp_root output_dir stamp package_dir package_file files_archive db_dump meta_file import_script
   local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port
@@ -789,13 +815,10 @@ wordpress_migration() {
   echo '本功能只在当前 VPS 生成迁移包，不会连接另一台 VPS。'
   echo '生成后请自行下载迁移包，再上传到目标 VPS 执行其中的导入脚本。'
   echo '迁移包包含：网站文件、数据库、导入工具和安全换域名功能。'
+  echo '缺少 PHP、数据库客户端或压缩工具时会自动安装。'
   echo '------------------------------------------------'
 
-  require_command php
-  require_command mysqldump
-  require_command mysql
-  require_command tar
-  require_command base64
+  install_migration_source_tools
 
   read -r -e -p 'WordPress 网站目录（例如 /var/www/example.com）：' wp_root
   wp_root="${wp_root%/}"
