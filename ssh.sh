@@ -1001,8 +1001,9 @@ wordpress_migration() {
   echo "网站目录：$wp_root"
   echo "数据库：$db_name"
   echo "输出文件：$package_file"
-  read -r -p '确认生成完整迁移包？请输入 YES：' confirm
-  [[ "$confirm" == 'YES' ]] || { info '已取消。'; rm -rf -- "$package_dir"; MIGRATION_TMP_DIR=''; pause; return; }
+  read -r -p '确认生成完整迁移包？[Y/n]：' confirm
+  confirm="${confirm:-Y}"
+  [[ "$confirm" =~ ^[Yy]$ ]] || { info '已取消。'; rm -rf -- "$package_dir"; MIGRATION_TMP_DIR=''; pause; return; }
 
   info '正在导出数据库…'
   MYSQL_PWD="$db_pass" mysqldump "${mysql_args[@]}" --single-transaction --quick --default-character-set=utf8mb4 \
