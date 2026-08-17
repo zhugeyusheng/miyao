@@ -1497,6 +1497,7 @@ echo "覆盖前备份：$backup_dir"
 info 'Nginx HTTP/HTTPS、证书扫描与自动申请流程已处理；请测试网站后再切换正式流量。'
 IMPORT_SCRIPT
   chmod 700 "$import_script"
+  bash -n "$import_script" || die '迁移包导入脚本语法检查失败，已停止生成迁移包。'
 
   tar -C "$package_dir" -czf "$package_file" wordpress-files.tar.gz database.sql migration.meta import-wordpress.sh || die '最终迁移包生成失败。'
   chmod 600 "$package_file"
