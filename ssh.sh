@@ -1437,6 +1437,136 @@ IMPORT_SCRIPT
   pause
 }
 
+show_tool_version() {
+  local tool="$1"
+  case "$tool" in
+    nginx) nginx -v 2>&1 | sed 's/^/当前版本：/' ;;
+    mysql) mysql --version 2>/dev/null | sed 's/^/当前版本：/' ;;
+    php) php -v 2>/dev/null | head -n1 | sed 's/^/当前版本：/' ;;
+    redis) redis-server --version 2>/dev/null | sed 's/^/当前版本：/' ;;
+  esac
+}
+
+update_website_tool() {
+  local tool="$1" package answer
+  case "$tool" in
+    nginx) package='nginx' ;;
+    mysql) package='mariadb-server mariadb-client' ;;
+    php) package='php-fpm php-cli php-mysql php-curl php-gd php-mbstring php-xml php-zip' ;;
+    redis) package='redis-server' ;;
+    *) return 1 ;;
+  esac
+  echo "------------------------------------------------"
+  echo "工具：$tool"
+  show_tool_version "$tool"
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "可用最新版：$(apt-cache policy ${package%% *} 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf list --available "$package" 2>/dev/null | tail -n +2 | head -n1 || true
+  fi
+  read -r -p "确认更新 $tool？[Y/n]：" answer
+  answer="${answer:-Y}"
+  [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y $package || { warn "$tool 更新失败。"; pause; return; }
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf upgrade -y $package || { warn "$tool 更新失败。"; pause; return; }
+  elif command -v yum >/dev/null 2>&1; then
+    yum update -y $package || { warn "$tool 更新失败。"; pause; return; }
+  else
+    warn '不支持当前系统的软件包管理器。'
+    pause
+    return
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    case "$tool" in
+      nginx) systemctl restart nginx || true ;;
+      mysql) systemctl restart mariadb >/dev/null 2>&1 || systemctl restart mysql >/dev/null 2>&1 || true ;;
+      php) systemctl restart php-fpm >/dev/null 2>&1 || true ;;
+      redis) systemctl restart redis-server >/dev/null 2>&1 || systemctl restart redis >/dev/null 2>&1 || true ;;
+    esac
+  fi
+  ok "$tool 更新完成。"
+  show_tool_version "$tool"
+  pause
+}
+
+website_status() {
+  local choice index config_file site_host root_url cert_file key_file http_code resolved expires
+  local -a configs=() sites=()
+  print_header
+  echo '                网站状态'
+  echo '------------------------------------------------'
+  mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
+    -maxdepth 2 -type f -name '*.conf' 2>/dev/null | sort -u)
+  for config_file in "${configs[@]}"; do
+    while IFS= read -r site_host; do
+      [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && sites+=("$site_host")
+    done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
+  done
+  mapfile -t sites < <(printf '%s\n' "${sites[@]}" | sort -u)
+  (( ${#sites[@]} > 0 )) || { warn '没有扫描到 Nginx 网站。'; pause; return; }
+  for index in "${!sites[@]}"; do printf '  %d. %s\n' "$((index + 1))" "${sites[$index]}"; done
+  read -r -p '请选择网站编号 [1]：' choice
+  choice="${choice:-1}"
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sites[@]} )) || { warn '选择无效。'; pause; return; }
+  site_host="${sites[$((choice - 1))]}"
+  root_url="https://$site_host"
+  echo "网站：$site_host"
+  if command -v getent >/dev/null 2>&1; then
+    resolved="$(getent ahosts "$site_host" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+    [[ -n "$resolved" ]] && ok "DNS：$resolved" || warn 'DNS：未解析到地址。'
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    http_code="$(curl -kIL --silent --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "$root_url" 2>/dev/null || true)"
+    [[ "$http_code" =~ ^[1-5][0-9][0-9]$ ]] && ok "HTTPS：HTTP $http_code" || warn 'HTTPS：无法访问。'
+  fi
+  cert_file=''; key_file=''
+  for cert_pair in "/etc/letsencrypt/live/$site_host/fullchain.pem|/etc/letsencrypt/live/$site_host/privkey.pem" "/home/web/certs/$site_host/fullchain.pem|/home/web/certs/$site_host/privkey.pem" "/etc/ssl/zhugeyusheng/$site_host/fullchain.pem|/etc/ssl/zhugeyusheng/$site_host/privkey.pem"; do
+    [[ -s "${cert_pair%%|*}" && -s "${cert_pair#*|}" ]] && { cert_file="${cert_pair%%|*}"; key_file="${cert_pair#*|}"; break; }
+  done
+  if [[ -n "$cert_file" && -n "$key_file" ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      expires="$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)"
+      ok "证书：$cert_file；到期：${expires:-未知}"
+    else
+      ok "证书：$cert_file"
+    fi
+  else
+    warn '证书：未发现匹配证书。'
+    info '可使用网站搬家导入流程自动申请，或确认 DNS 后重新执行证书申请。'
+  fi
+  nginx -t >/dev/null 2>&1 && ok 'Nginx 配置：通过' || warn 'Nginx 配置：失败'
+  pause
+}
+
+website_tools_menu() {
+  local choice
+  while true; do
+    print_header
+    echo '                网站工具更新'
+    echo '------------------------------------------------'
+    echo '1. Nginx'
+    echo '2. MySQL/MariaDB'
+    echo '3. PHP'
+    echo '4. Redis'
+    echo '5. 网站状态（域名、HTTPS、证书、Nginx）'
+    echo '0. 返回主菜单'
+    echo '------------------------------------------------'
+    read -r -p '请输入选择：' choice
+    case "$choice" in
+      1) update_website_tool nginx ;;
+      2) update_website_tool mysql ;;
+      3) update_website_tool php ;;
+      4) update_website_tool redis ;;
+      5) website_status ;;
+      0) return ;;
+      *) warn '无效选择'; pause ;;
+    esac
+  done
+}
+
 edit_nginx_site_config() {
   local choice index config_file backup_file editor
   local -a configs=()
@@ -1478,14 +1608,14 @@ website_migration_menu() {
     echo '------------------------------------------------'
     echo '1. 生成 WordPress 离线迁移包'
     echo '2. 导入 WordPress 迁移包（自动安装环境）'
-    echo '3. 编辑 Nginx 网站配置'
+    echo '3. 网站工具更新'
     echo '0. 返回主菜单'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
     case "$choice" in
       1) wordpress_migration ;;
       2) import_wordpress_package ;;
-      3) edit_nginx_site_config ;;
+      3) website_tools_menu ;;
       0) return ;;
       *) warn '无效选择'; pause ;;
     esac
