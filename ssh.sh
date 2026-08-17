@@ -877,6 +877,7 @@ wordpress_migration() {
   table_prefix="${wp_config_values[4]}"
   [[ "$db_name" =~ ^[A-Za-z0-9_]+$ && "$db_user" =~ ^[A-Za-z0-9_]+$ && "$table_prefix" =~ ^[A-Za-z0-9_]+$ ]] || { warn '数据库名、用户名或表前缀包含不支持的字符。'; pause; return; }
   [[ "$db_pass" != *$'\n'* && "$db_pass" != *$'\r'* ]] || { warn '数据库密码包含换行符，无法安全生成迁移包。'; pause; return; }
+  ok 'wp-config.php 数据库配置读取完成。'
 
   db_host_name="$db_host"
   db_port=''
@@ -899,8 +900,10 @@ wordpress_migration() {
       mysql_args=(-h "$db_host_name" -u "$db_user")
       ;;
   esac
+  mysql_args+=(--connect-timeout=5)
 
   db_error=''
+  info "正在按配置连接数据库：$db_host（最长等待 5 秒）…"
   if db_error="$(MYSQL_PWD="$db_pass" mysql "${mysql_args[@]}" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
     detected=1
     info "已按 wp-config.php 配置连接数据库：$db_host"
@@ -908,12 +911,13 @@ wordpress_migration() {
 
   # 自动扫描系统中的全部 MySQL/MariaDB Unix Socket。
   if (( detected == 0 )); then
-    mapfile -t socket_candidates < <(find /run /var/run /var/lib /tmp /opt /www -type s \
+    info '配置地址连接失败，正在快速扫描数据库 Socket…'
+    mapfile -t socket_candidates < <(find /run /var/run /var/lib/mysql /tmp /www/server/mysql -maxdepth 4 -type s \
       \( -name 'mysql.sock' -o -name 'mysqld.sock' -o -name 'mariadb.sock' \) 2>/dev/null | sort -u)
     for socket_candidate in "${socket_candidates[@]}"; do
-      if db_error="$(MYSQL_PWD="$db_pass" mysql -u "$db_user" -S "$socket_candidate" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+      if db_error="$(MYSQL_PWD="$db_pass" mysql -u "$db_user" -S "$socket_candidate" --connect-timeout=2 -NBe 'SELECT 1' "$db_name" 2>&1)"; then
         db_socket="$socket_candidate"
-        mysql_args=(-u "$db_user" -S "$db_socket")
+        mysql_args=(-u "$db_user" -S "$db_socket" --connect-timeout=5)
         db_error=''
         detected=1
         info "已自动发现数据库 Socket：$db_socket"
@@ -924,17 +928,18 @@ wordpress_migration() {
 
   # 自动扫描本机正在监听的 MySQL 常用及实际 TCP 端口。
   if (( detected == 0 )); then
+    info '正在扫描本机 MySQL/MariaDB 端口（每次最多 2 秒）…'
     port_candidates=(3306 3307 3308)
     if command -v ss >/dev/null 2>&1; then
       while IFS= read -r port_candidate; do
         [[ "$port_candidate" =~ ^[0-9]+$ ]] && port_candidates+=("$port_candidate")
-      done < <(ss -ltnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' | sort -nu)
+      done < <(ss -ltnpH 2>/dev/null | awk '/mysqld|mariadbd/ {n=split($4,a,":"); print a[n]}' | sort -nu)
     fi
     mapfile -t port_candidates < <(printf '%s\n' "${port_candidates[@]}" | awk '/^[0-9]+$/ && !seen[$0]++')
     for host_candidate in 127.0.0.1 localhost; do
       for port_candidate in "${port_candidates[@]}"; do
-        if db_error="$(MYSQL_PWD="$db_pass" mysql -h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
-          mysql_args=(-h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user")
+        if db_error="$(MYSQL_PWD="$db_pass" mysql -h "$host_candidate" -P "$port_candidate" --protocol=TCP --connect-timeout=2 -u "$db_user" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+          mysql_args=(-h "$host_candidate" -P "$port_candidate" --protocol=TCP --connect-timeout=5 -u "$db_user")
           db_error=''
           detected=1
           info "已自动发现数据库 TCP 地址：$host_candidate:$port_candidate"
@@ -946,13 +951,14 @@ wordpress_migration() {
 
   # WordPress 和数据库由 Docker 部署时，扫描所有运行中容器的内部 IP。
   if (( detected == 0 )) && command -v docker >/dev/null 2>&1; then
+    info '正在扫描 Docker 容器数据库（每次最多 2 秒）…'
     mapfile -t host_candidates < <(docker ps -q 2>/dev/null | while IFS= read -r container_id; do
       docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$container_id" 2>/dev/null
     done | awk 'NF && !seen[$0]++')
     for host_candidate in "${host_candidates[@]}"; do
       for port_candidate in 3306 3307; do
-        if db_error="$(MYSQL_PWD="$db_pass" mysql -h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
-          mysql_args=(-h "$host_candidate" -P "$port_candidate" --protocol=TCP -u "$db_user")
+        if db_error="$(MYSQL_PWD="$db_pass" mysql -h "$host_candidate" -P "$port_candidate" --protocol=TCP --connect-timeout=2 -u "$db_user" -NBe 'SELECT 1' "$db_name" 2>&1)"; then
+          mysql_args=(-h "$host_candidate" -P "$port_candidate" --protocol=TCP --connect-timeout=5 -u "$db_user")
           db_error=''
           detected=1
           info "已自动发现 Docker 数据库：$host_candidate:$port_candidate"
