@@ -1610,6 +1610,94 @@ website_tools_menu() {
   done
 }
 
+delete_domain_and_clear_cache() {
+  local choice index config_file domain root_dir db_name backup_dir confirm
+  local cert_dir cache_dir db_dump
+  local -a configs=() domains=()
+  print_header
+  echo '             缓存清理与删除域名'
+  echo '------------------------------------------------'
+  warn '此功能会删除 Nginx 配置、网站文件、数据库、证书和网站缓存。'
+  warn '删除前会自动备份到 /root/domain-delete-backups。'
+  mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
+    -maxdepth 2 -type f -name '*.conf' 2>/dev/null | sort -u)
+  for config_file in "${configs[@]}"; do
+    while IFS= read -r domain; do
+      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
+    done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
+  done
+  mapfile -t domains < <(printf '%s\n' "${domains[@]}" | sort -u)
+  (( ${#domains[@]} > 0 )) || { warn '没有扫描到可删除的网站域名。'; pause; return; }
+  for index in "${!domains[@]}"; do printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"; done
+  read -r -p '请选择要删除的域名编号：' choice
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )) || { warn '选择无效。'; pause; return; }
+  domain="${domains[$((choice - 1))]}"
+
+  config_file=''
+  for config_candidate in "${configs[@]}"; do
+    if awk -v wanted="$domain" '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); if ($i == wanted) found=1 } } END { exit !found }' "$config_candidate"; then
+      config_file="$config_candidate"
+      break
+    fi
+  done
+  [[ -n "$config_file" ]] || { warn "未找到域名配置：$domain"; pause; return; }
+  root_dir="$(awk '$1 == "root" { gsub(";", "", $2); print $2; exit }' "$config_file")"
+  [[ "$root_dir" == /* && "$root_dir" != '/' ]] || root_dir=''
+  db_name=''
+  if [[ -n "$root_dir" && -f "$root_dir/wp-config.php" ]]; then
+    db_name="$(php -r '$s=file_get_contents($argv[1]); if (preg_match("/define\\s*\\(\\s*[\\x27\\x22]DB_NAME[\\x27\\x22]\\s*,\\s*[\\x27\\x22]([^\\x27\\x22]+)[\\x27\\x22]/", $s, $m)) echo $m[1];' "$root_dir/wp-config.php" 2>/dev/null || true)"
+    [[ "$db_name" =~ ^[A-Za-z0-9_]+$ ]] || db_name=''
+  fi
+  echo '------------------------------------------------'
+  echo "准备删除域名：$domain"
+  echo "Nginx 配置：$config_file"
+  echo "网站目录：${root_dir:-未识别}"
+  echo "数据库：${db_name:-未识别/不删除}"
+  read -r -p "确认删除 $domain？请输入：DELETE $domain ：" confirm
+  [[ "$confirm" == "DELETE $domain" ]] || { info '已取消删除。'; pause; return; }
+
+  backup_dir="/root/domain-delete-backups/$(date +%Y%m%d-%H%M%S)-$domain"
+  mkdir -p -- "$backup_dir"
+  cp -a -- "$config_file" "$backup_dir/"
+  if [[ -n "$root_dir" && -d "$root_dir" ]]; then
+    tar -C "$root_dir" -czf "$backup_dir/site-files.tar.gz" .
+  fi
+  if [[ -n "$db_name" ]] && command -v mysqldump >/dev/null 2>&1; then
+    mysqldump --single-transaction --no-tablespaces --default-character-set=utf8mb4 "$db_name" > "$backup_dir/database.sql" 2>/dev/null || {
+      warn '数据库备份失败，已停止删除以避免无法恢复。'
+      pause
+      return
+    }
+  fi
+
+  rm -f -- "$config_file"
+  [[ -n "$root_dir" && "$root_dir" != '/' ]] && rm -rf -- "$root_dir"
+  for cert_dir in "/etc/letsencrypt/live/$domain" "/etc/letsencrypt/archive/$domain" "/etc/letsencrypt/renewal/$domain.conf" "/home/web/certs/$domain" "/etc/ssl/zhugeyusheng/$domain" "/root/.acme.sh/$domain" "/root/.acme.sh/${domain}_ecc"; do
+    rm -rf -- "$cert_dir"
+  done
+  if [[ -n "$root_dir" ]]; then
+    for cache_dir in "$root_dir/wp-content/cache" "/home/web/cache/$domain" "/var/cache/nginx/$domain"; do
+      rm -rf -- "$cache_dir"
+    done
+  fi
+  if [[ -n "$db_name" ]] && mysql -e "DROP DATABASE IF EXISTS \`$db_name\`;"; then
+    ok "数据库已删除：$db_name"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 || true; else nginx -s reload >/dev/null 2>&1 || true; fi
+
+  echo '------------------------------------------------'
+  ok "域名删除和缓存清理完成：$domain"
+  echo "删除备份：$backup_dir"
+  if find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d -maxdepth 2 -type f -name '*.conf' -print 2>/dev/null | xargs -r grep -lE "(^|[[:space:]])$domain([;[:space:]]|$)" >/dev/null 2>&1; then
+    warn 'Nginx 配置中仍发现该域名，请检查共享配置。'
+  else
+    ok 'Nginx 配置中未发现该域名。'
+  fi
+  [[ -n "$root_dir" && ! -e "$root_dir" ]] && ok '网站目录已清理。' || warn '网站目录仍存在，请手动检查。'
+  [[ -n "$db_name" ]] && mysql -NBe "SHOW DATABASES LIKE '$db_name'" | grep -Fxq "$db_name" && warn '数据库仍存在。' || ok '数据库已清理或未识别。'
+  pause
+}
+
 edit_nginx_site_config() {
   local choice index config_file backup_file editor
   local -a configs=()
@@ -1652,6 +1740,7 @@ website_migration_menu() {
     echo '1. 生成 WordPress 离线迁移包'
     echo '2. 导入 WordPress 迁移包（自动安装环境）'
     echo '3. 网站工具更新'
+    echo '4. 缓存清理与删除域名'
     echo '0. 返回主菜单'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
@@ -1659,6 +1748,7 @@ website_migration_menu() {
       1) wordpress_migration ;;
       2) import_wordpress_package ;;
       3) website_tools_menu ;;
+      4) delete_domain_and_clear_cache ;;
       0) return ;;
       *) warn '无效选择'; pause ;;
     esac
