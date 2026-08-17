@@ -564,11 +564,42 @@ request_domain_certificate() {
 }
 
 view_domain_status() {
-  local domain resolved cert_dir http_status
+  local domain resolved cert_dir http_status config_file choice index
+  local -a domains=() configs=()
   print_header
   echo '               查看域名情况'
   echo '------------------------------------------------'
-  read -r -p '请输入域名（例如 example.com）：' domain
+  info '正在自动扫描 Nginx 网站域名…'
+  mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
+    -maxdepth 2 -type f -name '*.conf' 2>/dev/null | sort -u)
+  for config_file in "${configs[@]}"; do
+    while IFS= read -r domain; do
+      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
+    done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
+  done
+  mapfile -t domains < <(printf '%s\n' "${domains[@]}" | sort -u)
+  if (( ${#domains[@]} > 0 )); then
+    echo '发现以下域名：'
+    for index in "${!domains[@]}"; do
+      printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"
+    done
+    echo '  M. 手动输入域名'
+    read -r -p '请选择域名编号 [1]：' choice
+    choice="${choice:-1}"
+    if [[ "$choice" =~ ^[Mm]$ ]]; then
+      read -r -p '请输入域名：' domain
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )); then
+      domain="${domains[$((choice - 1))]}"
+    else
+      warn '选择无效。'
+      pause
+      return
+    fi
+  else
+    warn '没有自动扫描到域名。'
+    read -r -p '请输入域名，或按 Enter 返回：' domain
+    [[ -n "$domain" ]] || return
+  fi
   domain="${domain,,}"
   domain="${domain%.}"
   if ! domain_is_valid "$domain"; then
