@@ -587,6 +587,14 @@ view_domain_status() {
     done
   fi
   if (( ${#domains[@]} == 0 )); then
+    # 部分面板只在站点目录和面板数据库记录域名，不写标准 Nginx 配置。
+    while IFS= read -r site_dir; do
+      domain="$(basename -- "$site_dir")"
+      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
+    done < <(find /home/web/html /www/wwwroot /var/www /srv/www /data/www \
+      -mindepth 1 -maxdepth 2 -type d 2>/dev/null)
+  fi
+  if (( ${#domains[@]} == 0 )); then
     # 部分面板使用域名作为配置文件名，文件内容不一定有标准 server_name 行。
     while IFS= read -r config_file; do
       domain="$(basename -- "$config_file")"
