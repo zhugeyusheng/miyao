@@ -808,7 +808,7 @@ wordpress_migration() {
   local wp_root output_dir stamp package_dir package_file files_archive db_dump meta_file import_script
   local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port db_socket db_error socket_candidate
   local port_candidate host_candidate container_id detected=0
-  local mysql_args=() confirm choice index config_file
+  local mysql_args=() dump_args=() confirm choice index config_file arg
   local -a wp_roots=() socket_candidates=() port_candidates=() host_candidates=()
 
   print_header
@@ -1006,7 +1006,11 @@ wordpress_migration() {
   [[ "$confirm" =~ ^[Yy]$ ]] || { info '已取消。'; rm -rf -- "$package_dir"; MIGRATION_TMP_DIR=''; pause; return; }
 
   info '正在导出数据库…'
-  MYSQL_PWD="$db_pass" mysqldump "${mysql_args[@]}" --single-transaction --quick --default-character-set=utf8mb4 \
+  dump_args=()
+  for arg in "${mysql_args[@]}"; do
+    [[ "$arg" == --connect-timeout=* ]] || dump_args+=("$arg")
+  done
+  MYSQL_PWD="$db_pass" mysqldump "${dump_args[@]}" --single-transaction --quick --default-character-set=utf8mb4 \
     --triggers "$db_name" > "$db_dump" || die '数据库导出失败。'
   info '正在打包 WordPress 文件…'
   tar -C "$wp_root" -czf "$files_archive" . || die '网站文件打包失败。'
