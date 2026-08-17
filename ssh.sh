@@ -1225,8 +1225,9 @@ fi
 echo "目标目录：$target_path"
 echo "新网站地址：${new_url:-保持数据库原值}"
 warn '目标目录和同名数据库将先备份，再由迁移内容覆盖。'
-read -r -p '确认导入？请输入 YES：' confirm
-[[ "$confirm" == 'YES' ]] || die '已取消导入。'
+  read -r -p '确认导入？[Y/n]：' confirm
+  confirm="${confirm:-Y}"
+  [[ "$confirm" =~ ^[Yy]$ ]] || die '已取消导入。'
 
 sql_pass="${db_pass//\\/\\\\}"
 sql_pass="${sql_pass//\'/\'\'}"
@@ -1316,6 +1317,96 @@ NGINX_CONFIG
   if nginx -t; then
     if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload; fi
     ok "Nginx 网站配置已生成：$nginx_config"
+
+    cert_file=''
+    key_file=''
+    for cert_pair in \
+      "/etc/letsencrypt/live/$site_host/fullchain.pem|/etc/letsencrypt/live/$site_host/privkey.pem" \
+      "/home/web/certs/$site_host/fullchain.pem|/home/web/certs/$site_host/privkey.pem" \
+      "/home/web/certs/$site_host/cert.pem|/home/web/certs/$site_host/key.pem" \
+      "/root/.acme.sh/${site_host}_ecc/fullchain.cer|/root/.acme.sh/${site_host}_ecc/$site_host.key" \
+      "/root/.acme.sh/$site_host/fullchain.cer|/root/.acme.sh/$site_host/$site_host.key"; do
+      cert_candidate="${cert_pair%%|*}"
+      key_candidate="${cert_pair#*|}"
+      if [[ -s "$cert_candidate" && -s "$key_candidate" ]]; then
+        if command -v openssl >/dev/null 2>&1 && \
+           ! openssl x509 -in "$cert_candidate" -noout -checkhost "$site_host" >/dev/null 2>&1; then
+          continue
+        fi
+        cert_file="$cert_candidate"
+        key_file="$key_candidate"
+        info "已发现网站证书：$cert_file"
+        break
+      fi
+    done
+
+    if [[ -z "$cert_file" ]]; then
+      warn "未发现 $site_host 的证书，正在尝试自动申请 Let's Encrypt 证书。"
+      acme_home='/root/.acme.sh'
+      if [[ ! -x "$acme_home/acme.sh" ]]; then
+        acme_installer="$(mktemp)"
+        if command -v curl >/dev/null 2>&1; then
+          curl -fL --silent --show-error --connect-timeout 10 --max-time 120 https://get.acme.sh -o "$acme_installer" || true
+        elif command -v wget >/dev/null 2>&1; then
+          wget -q --timeout=120 -O "$acme_installer" https://get.acme.sh || true
+        fi
+        [[ -s "$acme_installer" ]] && sh "$acme_installer" >/dev/null 2>&1 || true
+        rm -f -- "$acme_installer"
+      fi
+      cert_dir="/etc/ssl/zhugeyusheng/$site_host"
+      mkdir -p -- "$cert_dir"
+      if [[ -x "$acme_home/acme.sh" ]] && \
+         "$acme_home/acme.sh" --issue -d "$site_host" -w "$target_path" --keylength ec-256 && \
+         "$acme_home/acme.sh" --install-cert -d "$site_host" --ecc \
+           --key-file "$cert_dir/privkey.pem" --fullchain-file "$cert_dir/fullchain.pem" \
+           --reloadcmd 'systemctl reload nginx'; then
+        cert_file="$cert_dir/fullchain.pem"
+        key_file="$cert_dir/privkey.pem"
+        chmod 644 "$cert_file"
+        chmod 600 "$key_file"
+        ok "网站证书申请完成：$cert_file"
+      else
+        warn '证书自动申请失败；请确认新域名 DNS 已指向本 VPS，且公网 80 端口可访问。'
+      fi
+    fi
+
+    if [[ -n "$cert_file" && -n "$key_file" ]]; then
+      cp -a -- "$nginx_config" "${nginx_config}.http-only"
+      cat >> "$nginx_config" <<NGINX_SSL_CONFIG
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $site_host;
+    root $target_path;
+    index index.php index.html;
+    client_max_body_size 128m;
+    ssl_certificate $cert_file;
+    ssl_certificate_key $key_file;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+    location ~ \.php$ {
+        include /etc/nginx/fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_pass $fastcgi_target;
+    }
+    location ~* /\.(?!well-known/) {
+        deny all;
+    }
+}
+NGINX_SSL_CONFIG
+      if nginx -t; then
+        if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload; fi
+        ok "HTTPS 已自动应用到 Nginx：https://$site_host"
+      else
+        cp -a -- "${nginx_config}.http-only" "$nginx_config"
+        warn '证书已找到或签发，但 Nginx HTTPS 配置校验失败，请检查证书格式。'
+      fi
+      rm -f -- "${nginx_config}.http-only"
+    fi
   else
     rm -f -- "$nginx_config"
     warn 'Nginx 配置校验失败，已删除新配置；网站文件和数据库不受影响。'
@@ -1327,7 +1418,7 @@ ok 'WordPress 文件和数据库导入完成。'
 echo "目标目录：$target_path"
 echo "网站地址：${new_url:-数据库原值}"
 echo "覆盖前备份：$backup_dir"
-warn 'Nginx HTTP 配置已自动处理；请配置 HTTPS，测试无误后再修改 DNS。'
+info 'Nginx HTTP/HTTPS、证书扫描与自动申请流程已处理；请测试网站后再切换正式流量。'
 IMPORT_SCRIPT
   chmod 700 "$import_script"
 
@@ -1346,6 +1437,39 @@ IMPORT_SCRIPT
   pause
 }
 
+edit_nginx_site_config() {
+  local choice index config_file backup_file editor
+  local -a configs=()
+  print_header
+  echo '             编辑 Nginx 网站配置'
+  echo '------------------------------------------------'
+  command -v nginx >/dev/null 2>&1 || { warn '未安装 Nginx。'; pause; return; }
+  mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
+    -maxdepth 2 \( -type f -o -type l \) -name '*.conf' 2>/dev/null | sort -u)
+  (( ${#configs[@]} > 0 )) || { warn '没有扫描到 Nginx 网站配置。'; pause; return; }
+  for index in "${!configs[@]}"; do
+    printf '  %d. %s\n' "$((index + 1))" "${configs[$index]}"
+  done
+  read -r -p '请选择要编辑的配置编号 [1]：' choice
+  choice="${choice:-1}"
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#configs[@]} )) || { warn '选择无效。'; pause; return; }
+  config_file="$(readlink -f -- "${configs[$((choice - 1))]}")"
+  [[ -f "$config_file" ]] || { warn '配置文件不存在。'; pause; return; }
+  backup_file="${config_file}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a -- "$config_file" "$backup_file" || { warn '无法备份 Nginx 配置。'; pause; return; }
+  if command -v nano >/dev/null 2>&1; then editor='nano'; else editor='vi'; fi
+  "$editor" "$config_file"
+  if nginx -t; then
+    if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload; fi
+    ok "Nginx 配置已保存并生效，备份：$backup_file"
+  else
+    cp -a -- "$backup_file" "$config_file"
+    nginx -t >/dev/null 2>&1 || true
+    warn '新配置校验失败，已自动恢复原配置。'
+  fi
+  pause
+}
+
 website_migration_menu() {
   local choice
   while true; do
@@ -1354,12 +1478,14 @@ website_migration_menu() {
     echo '------------------------------------------------'
     echo '1. 生成 WordPress 离线迁移包'
     echo '2. 导入 WordPress 迁移包（自动安装环境）'
+    echo '3. 编辑 Nginx 网站配置'
     echo '0. 返回主菜单'
     echo '------------------------------------------------'
     read -r -p '请输入选择：' choice
     case "$choice" in
       1) wordpress_migration ;;
       2) import_wordpress_package ;;
+      3) edit_nginx_site_config ;;
       0) return ;;
       *) warn '无效选择'; pause ;;
     esac
