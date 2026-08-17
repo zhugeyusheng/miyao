@@ -570,13 +570,16 @@ view_domain_status() {
   echo '               查看域名情况'
   echo '------------------------------------------------'
   info '正在自动扫描 Nginx 网站域名…'
-  mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
-    -maxdepth 2 -type f -name '*.conf' 2>/dev/null | sort -u)
-  for config_file in "${configs[@]}"; do
-    while IFS= read -r domain; do
-      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
-    done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
-  done
+  mapfile -t domains < <(nginx -T 2>/dev/null | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
+  if (( ${#domains[@]} == 0 )); then
+    mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
+      -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | sort -u)
+    for config_file in "${configs[@]}"; do
+      while IFS= read -r domain; do
+        [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
+      done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
+    done
+  fi
   mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
   if (( ${#domains[@]} > 0 )); then
     echo '发现以下域名：'
