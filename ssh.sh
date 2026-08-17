@@ -571,10 +571,8 @@ view_domain_status() {
   echo '------------------------------------------------'
   info '正在自动扫描 Nginx 网站域名…'
   if command -v nginx >/dev/null 2>&1; then
-    mapfile -t domains < <(nginx -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
      mapfile -t domains < <(nginx -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$/' | sort -u)
   elif command -v openresty >/dev/null 2>&1; then
-    mapfile -t domains < <(openresty -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
      mapfile -t domains < <(openresty -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$/' | sort -u)
   fi
   if (( ${#domains[@]} == 0 )); then
@@ -584,7 +582,6 @@ view_domain_status() {
       -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | sort -u)
     for config_file in "${configs[@]}"; do
       while IFS= read -r domain; do
-        [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
          [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$ ]] && domains+=("$domain")
       done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
     done
@@ -602,7 +599,6 @@ view_domain_status() {
     while IFS= read -r config_file; do
       domain="$(basename -- "$config_file")"
       domain="${domain%.conf}"
-      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
       [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$ ]] && domains+=("$domain")
     done < <(find /home/web/conf.d /www/server/panel/vhost/nginx /www/server/panel/vhost/openresty \
       /usr/local/openresty/nginx/conf /www/server/nginx/conf -maxdepth 2 -type f 2>/dev/null)
@@ -615,12 +611,10 @@ view_domain_status() {
       /etc /home /www /data /opt /srv /var/www /usr/local /root /mnt /media 2>/dev/null || true)
     for config_file in "${broad_configs[@]}"; do
       while IFS= read -r domain; do
-        [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
         [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$ ]] && domains+=("$domain")
       done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file" 2>/dev/null)
     done
   fi
-  mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
   mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF && $0 ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,62}[.])+[A-Za-z]{2,63}$/' | sort -u)
   if (( ${#domains[@]} > 0 )); then
     echo '发现以下域名：'
@@ -1263,7 +1257,6 @@ case "$domain_choice" in
     ;;
 esac
 site_host="$(php -r '$h=parse_url($argv[1], PHP_URL_HOST); if ($h) echo strtolower($h);' "$new_url" 2>/dev/null || true)"
-if [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
  if [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$ ]]; then
   default_target_path="/var/www/$site_host"
 else
@@ -1304,8 +1297,8 @@ warn '目标目录和同名数据库将先备份，再由迁移内容覆盖。'
   confirm="${confirm:-Y}"
   [[ "$confirm" =~ ^[Yy]$ ]] || die '已取消导入。'
 
-sql_pass="${db_pass//\\/\\\\}"
-sql_pass="${sql_pass//\'/\'\'}"
+# 使用 sed 生成 SQL 字符串字面量，避免复杂的 Bash 参数替换在部分版本中被误解析。
+sql_pass="$(printf '%s' "$db_pass" | sed 's/\\\\/\\\\\\\\/g; s/'"'"'/'"'"''"'"'/g')"
 mysql <<SQL
 CREATE DATABASE IF NOT EXISTS \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '$db_user'@'localhost' IDENTIFIED BY '$sql_pass';
@@ -1354,7 +1347,6 @@ find "$target_path" -type f -exec chmod 644 {} +
 chmod 640 "$target_path/wp-config.php"
 site_host=''
 [[ -n "$new_url" ]] && site_host="$(php -r '$h=parse_url($argv[1], PHP_URL_HOST); if ($h) echo strtolower($h);' "$new_url" 2>/dev/null || true)"
-if [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
  if [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$ ]]; then
   php_socket=''
   shopt -s nullglob
@@ -1581,7 +1573,6 @@ website_status() {
       -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | sort -u)
   for config_file in "${configs[@]}"; do
     while IFS= read -r site_host; do
-      [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && sites+=("$site_host")
        [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$ ]] && sites+=("$site_host")
     done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
   done
@@ -1662,12 +1653,10 @@ delete_domain_and_clear_cache() {
     -maxdepth 4 \( -type f -o -type l \) 2>/dev/null | sort -u)
   for config_file in "${configs[@]}"; do
     while IFS= read -r domain; do
-      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
        [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$ ]] && domains+=("$domain")
     done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
   done
   if command -v nginx >/dev/null 2>&1; then
-    mapfile -t active_domains < <(nginx -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
      mapfile -t active_domains < <(nginx -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$/' | sort -u)
     domains+=("${active_domains[@]}")
   fi
