@@ -649,6 +649,36 @@ base64_one_line() {
   printf '%s' "$1" | base64 | tr -d '\r\n'
 }
 
+ensure_php_mysql_extension() {
+  local php_version php_package service_name
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' && return 0
+  php_version="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  warn "当前 PHP ${php_version:-未知版本} 缺少 MySQL 扩展，正在安装匹配版本。"
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update || return 1
+    php_package="php${php_version}-mysql"
+    if apt-cache show "$php_package" >/dev/null 2>&1; then
+      apt-get install -y "$php_package" || return 1
+    else
+      apt-get install -y php-mysql || return 1
+    fi
+    command -v phpenmod >/dev/null 2>&1 && phpenmod mysqli pdo_mysql >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y php-mysqlnd || return 1
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y php-mysqlnd || return 1
+  else
+    return 1
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    for service_name in "php${php_version}-fpm" php-fpm; do
+      systemctl restart "$service_name" >/dev/null 2>&1 || true
+    done
+  fi
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql'
+}
+
 install_wordpress_stack() {
   local need_install=0 pkg_manager='' wp_tmp='' service_name
   for cmd in nginx mysql php tar gzip base64; do
@@ -691,7 +721,7 @@ install_wordpress_stack() {
   command -v nginx >/dev/null 2>&1 || die 'Nginx 安装后仍不可用。'
   command -v mysql >/dev/null 2>&1 || die 'MySQL/MariaDB 客户端安装后仍不可用。'
   command -v php >/dev/null 2>&1 || die 'PHP 安装后仍不可用。'
-  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' || die 'PHP MySQL 扩展未正确安装。'
+  ensure_php_mysql_extension || die "PHP MySQL 扩展未正确安装。当前 PHP：$(command -v php)；版本：$(php -v 2>/dev/null | head -n1)"
 
   if ! command -v wp >/dev/null 2>&1; then
     info '正在安装 WordPress 管理工具 WP-CLI…'
@@ -1047,6 +1077,35 @@ ok() { printf "%b[成功]%b %s\n" "$GREEN" "$RESET" "$*"; }
 warn() { printf "%b[警告]%b %s\n" "$YELLOW" "$RESET" "$*" >&2; }
 die() { printf "%b[错误]%b %s\n" "$RED" "$RESET" "$*" >&2; exit 1; }
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die '请使用 root 权限运行导入脚本。'
+ensure_php_mysql_extension() {
+  local php_version php_package service_name
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' && return 0
+  php_version="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  warn "当前 PHP ${php_version:-未知版本} 缺少 MySQL 扩展，正在安装匹配版本。"
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update || return 1
+    php_package="php${php_version}-mysql"
+    if apt-cache show "$php_package" >/dev/null 2>&1; then
+      apt-get install -y "$php_package" || return 1
+    else
+      apt-get install -y php-mysql || return 1
+    fi
+    command -v phpenmod >/dev/null 2>&1 && phpenmod mysqli pdo_mysql >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y php-mysqlnd || return 1
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y php-mysqlnd || return 1
+  else
+    return 1
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    for service_name in "php${php_version}-fpm" php-fpm; do
+      systemctl restart "$service_name" >/dev/null 2>&1 || true
+    done
+  fi
+  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql'
+}
 auto_install_stack() {
   local missing=0 service_name wp_tmp
   for cmd in nginx mysql php tar gzip base64; do command -v "$cmd" >/dev/null 2>&1 || missing=1; done
@@ -1075,7 +1134,7 @@ auto_install_stack() {
     done
   fi
   for cmd in nginx mysql php tar gzip base64; do command -v "$cmd" >/dev/null 2>&1 || die "安装后仍缺少命令：$cmd"; done
-  php -m 2>/dev/null | grep -Eqi 'mysqli|pdo_mysql' || die 'PHP MySQL 扩展未正确安装。'
+  ensure_php_mysql_extension || die "PHP MySQL 扩展未正确安装。当前 PHP：$(command -v php)；版本：$(php -v 2>/dev/null | head -n1)"
   if ! command -v wp >/dev/null 2>&1; then
     info '正在安装 WordPress 管理工具 WP-CLI…'
     wp_tmp="$(mktemp)"
