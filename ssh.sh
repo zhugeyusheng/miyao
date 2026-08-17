@@ -1107,7 +1107,36 @@ old_url="$(decode "$OLD_URL_B64")"
 [[ "$db_name" =~ ^[A-Za-z0-9_]+$ && "$db_user" =~ ^[A-Za-z0-9_]+$ ]] || die '迁移包中的数据库标识符无效。'
 [[ "$db_pass" != *$'\n'* && "$db_pass" != *$'\r'* ]] || die '数据库密码格式不受支持。'
 
-read -r -e -p '目标网站目录（例如 /var/www/example.com）：' target_path
+old_url="${old_url%/}"
+echo '------------------------------------------------'
+echo "原网站地址：${old_url:-未知}"
+echo '1. 保留原网站域名'
+echo '2. 更换为新网站域名'
+read -r -p '请选择域名处理方式 [1]：' domain_choice
+domain_choice="${domain_choice:-1}"
+case "$domain_choice" in
+  1)
+    new_url="$old_url"
+    ;;
+  2)
+    read -r -p '请输入新域名或完整网址（例如 new.example.com）：' new_url
+    [[ -n "$new_url" ]] || die '新域名不能为空。'
+    [[ "$new_url" =~ ^https?:// ]] || new_url="https://$new_url"
+    new_url="${new_url%/}"
+    [[ "$new_url" =~ ^https?://[^[:space:]/]+$ ]] || die '新网站地址格式无效。'
+    ;;
+  *)
+    die '域名处理方式选择无效。'
+    ;;
+esac
+site_host="$(php -r '$h=parse_url($argv[1], PHP_URL_HOST); if ($h) echo strtolower($h);' "$new_url" 2>/dev/null || true)"
+if [[ "$site_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+  default_target_path="/var/www/$site_host"
+else
+  default_target_path='/var/www/wordpress'
+fi
+read -r -e -p "目标网站目录 [$default_target_path]：" target_path
+target_path="${target_path:-$default_target_path}"
 target_path="${target_path%/}"
 [[ "$target_path" =~ ^/[A-Za-z0-9._/-]+$ && "$target_path" != '/' ]] || die '目标网站目录必须是安全的绝对路径，且不能为根目录。'
 default_web_user='www-data'
@@ -1118,14 +1147,7 @@ read -r -p "网站文件所属用户 [$default_web_user]：" web_user
 web_user="${web_user:-$default_web_user}"
 [[ "$web_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || die '用户名称格式无效。'
 id "$web_user" >/dev/null 2>&1 || die "目标 VPS 不存在用户：$web_user"
-echo "原网站地址：${old_url:-未知}"
-read -r -p '新网站地址（不换域名直接回车）：' new_url
-new_url="${new_url:-$old_url}"
-if [[ -n "$new_url" ]]; then
-  [[ "$new_url" =~ ^https?://[^[:space:]/]+/?$ ]] || die '新网站地址格式无效。'
-  new_url="${new_url%/}"
-fi
-old_url="${old_url%/}"
+echo "迁移后网站地址：${new_url:-数据库原值}"
 
 mysql -e 'SELECT 1' >/dev/null 2>&1 || die '无法以系统 root 管理 MySQL/MariaDB，请先配置 root 本地 socket 登录。'
 stamp="$(date +%Y%m%d-%H%M%S)"
