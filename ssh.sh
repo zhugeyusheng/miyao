@@ -807,7 +807,8 @@ install_migration_source_tools() {
 wordpress_migration() {
   local wp_root output_dir stamp package_dir package_file files_archive db_dump meta_file import_script
   local db_name db_user db_pass db_host table_prefix old_url db_host_name db_port
-  local mysql_args=() confirm
+  local mysql_args=() confirm choice index config_file
+  local -a wp_roots=()
 
   print_header
   echo '           WordPress 离线搬家包生成'
@@ -820,10 +821,40 @@ wordpress_migration() {
 
   install_migration_source_tools
 
-  read -r -e -p 'WordPress 网站目录（例如 /var/www/example.com）：' wp_root
+  info '正在扫描 VPS 文件系统中的 WordPress 网站…'
+  mapfile -t wp_roots < <(find / \
+    \( -path /proc -o -path /sys -o -path /dev -o -path /run \
+       -o -path /snap -o -path /lost+found \
+       -o -path '*/wp-content/cache' -o -path '*/wp-content/uploads' \) -prune -o \
+    -type f -name wp-config.php -print 2>/dev/null | while IFS= read -r config_file; do dirname -- "$config_file"; done | sort -u)
+
+  if (( ${#wp_roots[@]} > 0 )); then
+    echo '发现以下 WordPress 网站目录：'
+    for index in "${!wp_roots[@]}"; do
+      printf '  %d. %s\n' "$((index + 1))" "${wp_roots[$index]}"
+    done
+    echo '  M. 手动输入其他目录'
+    read -r -p '请选择网站编号 [1]：' choice
+    choice="${choice:-1}"
+    if [[ "$choice" =~ ^[Mm]$ ]]; then
+      read -r -e -p '请输入 WordPress 网站目录：' wp_root
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#wp_roots[@]} )); then
+      wp_root="${wp_roots[$((choice - 1))]}"
+    else
+      warn '选择无效。'
+      pause
+      return
+    fi
+  else
+    warn '没有自动扫描到 wp-config.php。'
+    read -r -e -p '请输入 WordPress 网站目录，或按 Enter 返回：' wp_root
+    [[ -n "$wp_root" ]] || return
+  fi
   wp_root="${wp_root%/}"
   [[ "$wp_root" == /* && -f "$wp_root/wp-config.php" ]] || { warn '目录无效或未找到 wp-config.php。'; pause; return; }
+  [[ -f "$wp_root/wp-load.php" && -d "$wp_root/wp-content" ]] || { warn '该目录包含 wp-config.php，但不是完整的 WordPress 网站目录。'; pause; return; }
 
+  info "已选择 WordPress 网站目录：$wp_root"
   info '正在读取 wp-config.php 数据库配置…'
   mapfile -t wp_config_values < <(php -r '
     $s = file_get_contents($argv[1]);
