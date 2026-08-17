@@ -1245,6 +1245,13 @@ find "$target_path" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 tar -xzf "$script_dir/wordpress-files.tar.gz" -C "$target_path"
 mysql --default-character-set=utf8mb4 "$db_name" < "$script_dir/database.sql"
 
+# 目标数据库由本脚本部署在本机，源站若使用 Docker 服务名（如 mysql），必须改为 localhost。
+wp config set DB_HOST localhost --type=constant --path="$target_path" --allow-root --quiet || \
+  die '无法将 wp-config.php 的 DB_HOST 更新为 localhost。'
+wp db check --path="$target_path" --allow-root >/dev/null 2>&1 || \
+  die 'WordPress 无法连接目标数据库，请检查 wp-config.php 和本机 MariaDB/MySQL。'
+ok 'WordPress 已连接目标数据库。'
+
 if [[ -n "$old_url" && -n "$new_url" && "$old_url" != "$new_url" ]]; then
   wp_cmd=''
   if command -v wp >/dev/null 2>&1; then
