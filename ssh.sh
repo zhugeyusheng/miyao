@@ -1618,18 +1618,25 @@ delete_domain_and_clear_cache() {
   warn '此功能会删除 Nginx 配置、网站文件、数据库、证书和网站缓存。'
   warn '删除前会自动备份到 /root/domain-delete-backups。'
   mapfile -t configs < <(find /etc/nginx/conf.d /etc/nginx/sites-enabled /home/web/conf.d \
-    -maxdepth 2 -type f -name '*.conf' 2>/dev/null | sort -u)
+    /www/server/panel/vhost/nginx /www/server/panel/vhost/openresty \
+    /usr/local/openresty/nginx/conf /www/server/nginx/conf \
+    -maxdepth 4 \( -type f -o -type l \) 2>/dev/null | sort -u)
   for config_file in "${configs[@]}"; do
     while IFS= read -r domain; do
       [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && domains+=("$domain")
     done < <(awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' "$config_file")
   done
+  if command -v nginx >/dev/null 2>&1; then
+    mapfile -t active_domains < <(nginx -T 2>&1 | awk '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); print $i } }' | awk '/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/' | sort -u)
+    domains+=("${active_domains[@]}")
+  fi
   mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | sort -u)
   if [[ -n "${DELETE_DOMAIN_TARGET:-}" ]]; then
     domain="$DELETE_DOMAIN_TARGET"
     unset DELETE_DOMAIN_TARGET
     if (( ${#domains[@]} == 0 )); then
-      mapfile -t configs < <(grep -RIl --exclude='*.bak*' -E "server_name[[:space:]].*${domain}" /etc/nginx /home/web/conf.d 2>/dev/null || true)
+      mapfile -t configs < <(grep -RIl --exclude='*.bak*' -E "server_name[[:space:]].*${domain}" \
+        /etc/nginx /home/web/conf.d /www/server/panel/vhost /usr/local/openresty/nginx/conf /www/server/nginx/conf 2>/dev/null || true)
     fi
   else
     (( ${#domains[@]} > 0 )) || { warn '没有扫描到可删除的网站域名。'; pause; return; }
@@ -1647,7 +1654,8 @@ delete_domain_and_clear_cache() {
     fi
   done
   if [[ -z "$config_file" ]]; then
-    mapfile -t configs < <(grep -RIl --exclude='*.bak*' -E "server_name[[:space:]].*${domain}" /etc/nginx /home/web/conf.d 2>/dev/null || true)
+    mapfile -t configs < <(grep -RIl --exclude='*.bak*' -E "server_name[[:space:]].*${domain}" \
+      /etc/nginx /home/web/conf.d /www/server/panel/vhost /usr/local/openresty/nginx/conf /www/server/nginx/conf 2>/dev/null || true)
     for config_candidate in "${configs[@]}"; do
       if awk -v wanted="$domain" '$1 == "server_name" { for (i=2; i<=NF; i++) { gsub(";", "", $i); if ($i == wanted) found=1 } } END { exit !found }' "$config_candidate"; then
         config_file="$config_candidate"
